@@ -1,0 +1,78 @@
+# =============================================================================
+# 3DGSMR: 3D Gaussian Representation for MRI Reconstruction
+# Default Configuration File (Fully Aligned with Paper)
+# =============================================================================
+
+# Data Configuration
+data:
+  data_path:  "/data/data54/wanghaobo/data/3D_Data/raw_data2/ksp.mat"  # Supports .h5 and .mat k-space files
+  csm_path: null # "/data0/congcong/data/3D_data/h5data/csm.mat" null
+  acceleration_factor: 4
+  mask_type: "poisson"
+  use_acs: true
+  acs_lines: 32
+
+# Gaussian Model Configuration
+gaussian:
+  initial_num_points: 500
+  max_num_points: 400000
+  initial_scale: 2.0
+  position_lr: 0.001
+  scale_lr: 0.005
+  rotation_lr: 0.001
+  density_lr: 0.01
+  complex_density: true
+
+# Adaptive Control (Densification) Configuration
+adaptive_control:
+  enable: true
+  densify_from_iter: 100
+  densify_every: 100
+  densify_until_iter: 2500
+  grad_threshold: 0.005
+  use_long_axis_splitting: true
+  scale_threshold: 0.0005
+  use_cloning: false
+  opacity_threshold: 0.01
+
+# Training Configuration
+training:
+  max_iterations: 3000
+  save_every: 500
+  log_every: 50
+  eval_every: 100
+  lr_scheduler:
+    type: "exponential"
+    gamma: 0.95
+    step_size: 200
+  seed: 42
+  max_grad_norm: 1.0
+
+# Loss Configuration
+loss:
+  kspace_weight: 1.0
+  image_weight: 0.0
+  tv_weight: 0.1
+  loss_type: "l2"
+
+# Output Configuration
+output:
+  output_dir: "./results"
+  exp_name: "3dgsmr_exp"
+  save_nii: true
+  save_npy: true
+  use_tensorboard: true
+
+# Test Configuration (New Added)
+test:
+  # 默认切片索引 (如果没有在命令行指定)
+  slices:
+    axial: [57, 85, 114]     # D dim
+    coronal: [45, 68, 90]    # H dim
+    sagittal: [52, 78, 104]  # W dim
+
+# Hardware Configuration
+hardware:
+  device: "cuda:0"
+  use_amp: false
+  num_workers: 16
