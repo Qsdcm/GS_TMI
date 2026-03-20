@@ -1,8 +1,4 @@
-# =============================================================================
-# 3DGSMR paper-faithful default profile
-# Default maps to the paper low-mid acceleration branch.
-# =============================================================================
-
+# Paper-faithful low-mid acceleration profile.
 mode:
   paper_faithful: true
   experimental_reproduction: true

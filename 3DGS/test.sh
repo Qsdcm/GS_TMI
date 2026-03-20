@@ -1,8 +1,10 @@
-bash scripts/test.sh \
-    --dataset "/data0/congcong/data/Anke_2D/Anke_3D/Gao_3D_dataread/03_0_5T_kspace_norm_nopermute.h5" \
-    --weights /data0/congcong/code/haobo/V3/3DGS/3dgsVC/LOWoutputs/acc2_pts510_grad0.005_seed42/checkpoints/best.pth \
-    --acceleration 2 \
-    --gpu 3 \
-    --slices_axial "30 29 31" \
-    --slices_coronal "60 120" \
-    --slices_sagittal "70 140"
+# Example paper-faithful evaluation command
+bash 3dgsVC/scripts/test.sh \
+    --config 3dgsVC/configs/paper_lowmid.yaml \
+    --dataset "/data/data54/wanghaobo/data/3D_Data/raw_data2/ksp.mat" \
+    --weights "./results/paper_lowmid_acc8_pts200000_original_tile_cuda_seed42/checkpoints/best.pth" \
+    --acceleration 8 \
+    --gpu 1 \
+    --slices_axial "20 40 10" \
+    --slices_coronal "30 60 150" \
+    --slices_sagittal "51 52 53"

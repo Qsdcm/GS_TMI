@@ -1,18 +1,17 @@
 import torch
 import torch.nn as nn
-import numpy as np
-from typing import Tuple, Optional, Dict
-import math 
+from typing import Optional, Tuple
+
 
 def quaternion_to_rotation_matrix(quaternion: torch.Tensor) -> torch.Tensor:
-    """将四元数转换为旋转矩阵"""
     norm = quaternion.norm(dim=-1, keepdim=True)
     quaternion = quaternion / (norm + 1e-8)
     w, x, y, z = quaternion.unbind(-1)
-    row0 = torch.stack([1 - 2*y*y - 2*z*z, 2*x*y - 2*z*w, 2*x*z + 2*y*w], dim=-1)
-    row1 = torch.stack([2*x*y + 2*z*w, 1 - 2*x*x - 2*z*z, 2*y*z - 2*x*w], dim=-1)
-    row2 = torch.stack([2*x*z - 2*y*w, 2*y*z + 2*x*w, 1 - 2*x*x - 2*y*y], dim=-1)
+    row0 = torch.stack([1 - 2 * y * y - 2 * z * z, 2 * x * y - 2 * z * w, 2 * x * z + 2 * y * w], dim=-1)
+    row1 = torch.stack([2 * x * y + 2 * z * w, 1 - 2 * x * x - 2 * z * z, 2 * y * z - 2 * x * w], dim=-1)
+    row2 = torch.stack([2 * x * z - 2 * y * w, 2 * y * z + 2 * x * w, 1 - 2 * x * x - 2 * y * y], dim=-1)
     return torch.stack([row0, row1, row2], dim=-2)
+
 
 class GaussianModel3D(nn.Module):
     def __init__(
@@ -22,179 +21,160 @@ class GaussianModel3D(nn.Module):
         initial_positions: Optional[torch.Tensor] = None,
         initial_densities: Optional[torch.Tensor] = None,
         initial_scales: Optional[torch.Tensor] = None,
-        device: str = "cuda:0"
+        device: str = "cuda:0",
     ):
         super().__init__()
         self.num_points = num_points
         self.volume_shape = volume_shape
         self.device = device
         self._init_parameters(initial_positions, initial_densities, initial_scales)
-        
+
     def _init_parameters(
         self,
         positions: Optional[torch.Tensor],
         densities: Optional[torch.Tensor],
-        scales: Optional[torch.Tensor]
+        scales: Optional[torch.Tensor],
     ):
-        N = self.num_points
-        
-        # 1. 位置
+        n_points = self.num_points
         if positions is None:
-            positions = torch.rand(N, 3, device=self.device) * 2 - 1
+            positions = torch.rand(n_points, 3, device=self.device) * 2 - 1
         self.positions = nn.Parameter(positions)
-        
-        # 2. 尺度 (Log空间)
+
         if scales is None:
-            # 初始化为约1个体素大小 (2.0 / 150 ≈ 0.013)
-            # 确保初始尺度大于 scale_threshold (0.0005) 以允许分裂
-            scales = torch.ones(N, 3, device=self.device) * (2.0 / self.volume_shape[0])
+            base_scale = torch.ones(n_points, 3, device=self.device) * (2.0 / max(self.volume_shape[0], 1))
+            scales = base_scale
         self.scales = nn.Parameter(torch.log(torch.clamp(scales, min=1e-8)))
-        
-        # 3. 旋转 (四元数 [1,0,0,0])
-        rotations = torch.zeros(N, 4, device=self.device)
+
+        rotations = torch.zeros(n_points, 4, device=self.device)
         rotations[:, 0] = 1.0
         self.rotations = nn.Parameter(rotations)
-        
-        # 4. 密度
+
         if densities is None:
-            densities = torch.randn(N, dtype=torch.complex64, device=self.device) * 0.1
+            densities = torch.randn(n_points, dtype=torch.complex64, device=self.device) * 0.1
         self.density_real = nn.Parameter(densities.real)
         self.density_imag = nn.Parameter(densities.imag)
-        
+
     @property
     def density(self) -> torch.Tensor:
         return torch.complex(self.density_real, self.density_imag)
-    
+
     def get_scale_values(self) -> torch.Tensor:
         return torch.exp(self.scales)
 
-    # 兼容接口
     def get_scales(self) -> torch.Tensor:
         return self.get_scale_values()
 
     def get_densities(self) -> torch.Tensor:
         return self.density
-    
+
     def get_optimizable_params(self, lr_position=1e-4, lr_density=1e-3, lr_scale=5e-4, lr_rotation=1e-4):
         return [
-            {'params': [self.positions], 'lr': lr_position},
-            {'params': [self.scales], 'lr': lr_scale},
-            {'params': [self.rotations], 'lr': lr_rotation},
-            {'params': [self.density_real], 'lr': lr_density},
-            {'params': [self.density_imag], 'lr': lr_density},
+            {"params": [self.positions], "lr": lr_position},
+            {"params": [self.scales], "lr": lr_scale},
+            {"params": [self.rotations], "lr": lr_rotation},
+            {"params": [self.density_real], "lr": lr_density},
+            {"params": [self.density_imag], "lr": lr_density},
         ]
 
     def densify_and_split(
         self,
         grads: torch.Tensor,
         grad_threshold: float = 0.0002,
-        scale_threshold: float = 0.0005, # 默认值调低
-        use_long_axis_splitting: bool = True
+        scale_threshold: float = 0.0005,
+        use_long_axis_splitting: bool = True,
+        long_axis_offset_factor: float = 1.0,
     ) -> int:
         with torch.no_grad():
             scales = self.get_scale_values()
             max_scales = scales.max(dim=-1)[0]
-            
             mask = (grads > grad_threshold) & (max_scales > scale_threshold)
-            if mask.sum() == 0: return 0
-            
-            p_pos = self.positions[mask]
-            p_scale = scales[mask]
-            p_rot = self.rotations[mask]
-            p_den_r = self.density_real[mask]
-            p_den_i = self.density_imag[mask]
-            
-            K = p_pos.shape[0]
-            
+            if mask.sum() == 0:
+                return 0
+
+            parent_positions = self.positions[mask]
+            parent_scales = scales[mask]
+            parent_rotations = self.rotations[mask]
+            parent_den_r = self.density_real[mask]
+            parent_den_i = self.density_imag[mask]
+            split_count = parent_positions.shape[0]
+
             if use_long_axis_splitting:
-                # 论文策略: 沿长轴分裂
-                longest_axis = p_scale.argmax(dim=-1)
-                offset_val = p_scale[torch.arange(K), longest_axis]
-                
-                local_shift = torch.zeros_like(p_pos)
-                local_shift[torch.arange(K), longest_axis] = offset_val * 1.0 
-                
-                R = quaternion_to_rotation_matrix(p_rot)
-                global_shift = torch.bmm(R, local_shift.unsqueeze(-1)).squeeze(-1)
-                
-                new_pos_1 = p_pos + global_shift
-                new_pos_2 = p_pos - global_shift
-                
-                new_scale = p_scale.clone()
-                # 论文: 其他两轴缩放 0.85
-                mask_other = torch.ones_like(new_scale, dtype=torch.bool)
-                mask_other[torch.arange(K), longest_axis] = False
-                new_scale[mask_other] *= 0.85
-                
-                # Paper: "splits the Gaussian points along the longest axis to half"
-                new_scale[torch.arange(K), longest_axis] *= 0.5
-                
-                new_positions = torch.cat([new_pos_1, new_pos_2], dim=0)
-                new_scales = torch.cat([new_scale, new_scale], dim=0)
-                new_rotations = torch.cat([p_rot, p_rot], dim=0)
-                
-                # Paper Section D: "central values are scaled down by a factor of 0.6"
-                # (long-axis splitting specific)
-                new_den_r = torch.cat([p_den_r * 0.6, p_den_r * 0.6], dim=0)
-                new_den_i = torch.cat([p_den_i * 0.6, p_den_i * 0.6], dim=0)
+                longest_axis = parent_scales.argmax(dim=-1)
+                child_scale = parent_scales.clone()
+                child_scale[torch.arange(split_count), longest_axis] *= 0.5
+                other_mask = torch.ones_like(child_scale, dtype=torch.bool)
+                other_mask[torch.arange(split_count), longest_axis] = False
+                child_scale[other_mask] *= 0.85
 
+                local_shift = torch.zeros_like(parent_positions)
+                local_shift[torch.arange(split_count), longest_axis] = (
+                    child_scale[torch.arange(split_count), longest_axis] * long_axis_offset_factor
+                )
+                rotation_matrix = quaternion_to_rotation_matrix(parent_rotations)
+                global_shift = torch.bmm(rotation_matrix, local_shift.unsqueeze(-1)).squeeze(-1)
+
+                new_positions = torch.cat([parent_positions + global_shift, parent_positions - global_shift], dim=0)
+                new_scales = torch.cat([child_scale, child_scale], dim=0)
+                new_rotations = torch.cat([parent_rotations, parent_rotations], dim=0)
+                new_den_r = torch.cat([parent_den_r * 0.6, parent_den_r * 0.6], dim=0)
+                new_den_i = torch.cat([parent_den_i * 0.6, parent_den_i * 0.6], dim=0)
             else:
-                # Original splitting strategy (Paper Section D):
-                # "each with size equals to the original Gaussian size scaled by a factor of 1/1.6"
-                # "central values are scaled down by half"
-                std = p_scale
-                offset = torch.randn_like(p_pos) * std * 0.5
-                new_positions = torch.cat([p_pos - offset, p_pos + offset], dim=0)
-                new_scales = torch.cat([p_scale/1.6, p_scale/1.6], dim=0)
-                new_rotations = torch.cat([p_rot, p_rot], dim=0)
-                new_den_r = torch.cat([p_den_r * 0.5, p_den_r * 0.5], dim=0)
-                new_den_i = torch.cat([p_den_i * 0.5, p_den_i * 0.5], dim=0)
+                # Paper specifies Gaussian children follow a normal distribution centered at the parent.
+                noise_a = torch.randn_like(parent_positions) * parent_scales * 0.5
+                noise_b = torch.randn_like(parent_positions) * parent_scales * 0.5
+                new_positions = torch.cat([parent_positions + noise_a, parent_positions + noise_b], dim=0)
+                new_scales = torch.cat([parent_scales / 1.6, parent_scales / 1.6], dim=0)
+                new_rotations = torch.cat([parent_rotations, parent_rotations], dim=0)
+                new_den_r = torch.cat([parent_den_r * 0.5, parent_den_r * 0.5], dim=0)
+                new_den_i = torch.cat([parent_den_i * 0.5, parent_den_i * 0.5], dim=0)
 
-            keep_mask = ~mask
-            self._update_params(keep_mask, new_positions, new_scales, new_rotations, new_den_r, new_den_i)
-            return K
+            self._update_params(~mask, new_positions, new_scales, new_rotations, new_den_r, new_den_i)
+            return split_count
 
-    def densify_and_clone(self, grads, grad_threshold, scale_threshold):
-        """
-        Paper Section D: "For cloning, another Gaussian point of the same shape and scale
-        is added in the same position. The central density values are scaled to half."
-        Both original and clone get density/2.
-        """
+    def densify_and_clone(self, grads: torch.Tensor, grad_threshold: float, scale_threshold: float) -> int:
         with torch.no_grad():
-             scales = self.get_scale_values()
-             max_scales = scales.max(dim=-1)[0]
-             mask = (grads > grad_threshold) & (max_scales <= scale_threshold)
-             if mask.sum() == 0: return 0
+            scales = self.get_scale_values()
+            max_scales = scales.max(dim=-1)[0]
+            mask = (grads > grad_threshold) & (max_scales <= scale_threshold)
+            if mask.sum() == 0:
+                return 0
 
-             # Paper: "central density values are scaled to half"
-             # Halve density of originals that will be cloned
-             self.density_real.data[mask] *= 0.5
-             self.density_imag.data[mask] *= 0.5
+            self.density_real.data[mask] *= 0.5
+            self.density_imag.data[mask] *= 0.5
 
-             new_pos = self.positions[mask]
-             new_scale = scales[mask]
-             new_rot = self.rotations[mask]
-             # Clone inherits the already-halved density
-             new_dr = self.density_real[mask].clone()
-             new_di = self.density_imag[mask].clone()
+            new_pos = self.positions[mask]
+            new_scale = scales[mask]
+            new_rot = self.rotations[mask]
+            new_den_r = self.density_real[mask].clone()
+            new_den_i = self.density_imag[mask].clone()
 
-             self.positions = nn.Parameter(torch.cat([self.positions, new_pos], dim=0))
-             self.scales = nn.Parameter(torch.cat([self.scales, torch.log(new_scale+1e-8)], dim=0))
-             self.rotations = nn.Parameter(torch.cat([self.rotations, new_rot], dim=0))
-             self.density_real = nn.Parameter(torch.cat([self.density_real, new_dr], dim=0))
-             self.density_imag = nn.Parameter(torch.cat([self.density_imag, new_di], dim=0))
-             self.num_points = self.positions.shape[0]
-             return mask.sum().item()
+            self.positions = nn.Parameter(torch.cat([self.positions, new_pos], dim=0))
+            self.scales = nn.Parameter(torch.cat([self.scales, torch.log(new_scale + 1e-8)], dim=0))
+            self.rotations = nn.Parameter(torch.cat([self.rotations, new_rot], dim=0))
+            self.density_real = nn.Parameter(torch.cat([self.density_real, new_den_r], dim=0))
+            self.density_imag = nn.Parameter(torch.cat([self.density_imag, new_den_i], dim=0))
+            self.num_points = self.positions.shape[0]
+            return int(mask.sum().item())
 
-    def prune(self, opacity_threshold):
+    def prune(self, opacity_threshold: float) -> int:
         with torch.no_grad():
             density_mag = torch.abs(self.density)
-            mask = density_mag > opacity_threshold
-            if mask.sum() == self.num_points: return 0
-            self._update_params(mask, None, None, None, None, None, is_prune=True)
-            return (len(mask) - mask.sum().item())
+            keep_mask = density_mag > opacity_threshold
+            if keep_mask.sum() == self.num_points:
+                return 0
+            self._update_params(keep_mask, None, None, None, None, None, is_prune=True)
+            return int((~keep_mask).sum().item())
 
-    def _update_params(self, mask, new_pos=None, new_scale=None, new_rot=None, new_dr=None, new_di=None, is_prune=False):
+    def _update_params(
+        self,
+        mask: torch.Tensor,
+        new_pos: Optional[torch.Tensor] = None,
+        new_scale: Optional[torch.Tensor] = None,
+        new_rot: Optional[torch.Tensor] = None,
+        new_dr: Optional[torch.Tensor] = None,
+        new_di: Optional[torch.Tensor] = None,
+        is_prune: bool = False,
+    ):
         if is_prune:
             self.positions = nn.Parameter(self.positions[mask])
             self.scales = nn.Parameter(self.scales[mask])
@@ -209,99 +189,109 @@ class GaussianModel3D(nn.Module):
             self.density_imag = nn.Parameter(torch.cat([self.density_imag[mask], new_di], dim=0))
         self.num_points = self.positions.shape[0]
 
-    @classmethod
-    def from_image(cls, image: torch.Tensor, num_points: int, initial_scale: float = 2.0,
-                   density_scale_k: float = 0.2, init_mode: str = "importance",
-                   device: str = "cuda:0"):
-        """
-        Paper Section C: Initialize from zero-filled iFFT reconstruction.
-
-        init_mode:
-          "importance" — sample from high-magnitude voxels (practical, avoids
-                         wasting Gaussians on background/air). Recommended for M≤10k.
-          "random"     — uniform random from all voxels (paper literal: "randomly
-                         sample M grid points"). Works well for large M (200k).
-        """
-        # Handle [2, D, H, W] input
+    @staticmethod
+    def _extract_complex_image(image: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if image.ndim == 4 and image.shape[0] == 2:
-            C, D, H, W = image.shape
-            mag = torch.sqrt(image[0]**2 + image[1]**2)
-            densities_real = image[0]
-            densities_imag = image[1]
-        else:
-            D, H, W = image.shape
-            mag = torch.abs(image)
-            if torch.is_complex(image):
-                densities_real = image.real
-                densities_imag = image.imag
-            else:
-                densities_real = image
-                densities_imag = torch.zeros_like(image)
+            mag = torch.sqrt(image[0] ** 2 + image[1] ** 2 + 1e-12)
+            return mag, image[0], image[1]
+        if torch.is_complex(image):
+            return torch.abs(image), image.real, image.imag
+        return torch.abs(image), image, torch.zeros_like(image)
 
-        total_voxels = D * H * W
-        mag_flat = mag.flatten()
+    @staticmethod
+    def _grid_positions_from_indices(indices: torch.Tensor, shape: Tuple[int, int, int]) -> Tuple[torch.Tensor, torch.Tensor]:
+        d_size, h_size, w_size = shape
+        z = indices // (h_size * w_size)
+        rem = indices % (h_size * w_size)
+        y = rem // w_size
+        x = rem % w_size
+        voxel_coords = torch.stack([z, y, x], dim=-1)
+        positions = torch.stack(
+            [
+                ((z.float() + 0.5) / d_size) * 2 - 1,
+                ((y.float() + 0.5) / h_size) * 2 - 1,
+                ((x.float() + 0.5) / w_size) * 2 - 1,
+            ],
+            dim=-1,
+        )
+        return voxel_coords, positions
 
-        if init_mode == "importance":
-            # Sample from high-magnitude regions (top 90%)
-            # Avoids wasting Gaussians on zero-signal background
+    @staticmethod
+    def _exact_grid_scale_init(voxel_coords: torch.Tensor, shape: Tuple[int, int, int], device: torch.device) -> torch.Tensor:
+        d_size, h_size, w_size = shape
+        step_d = 2.0 / max(d_size, 1)
+        step_h = 2.0 / max(h_size, 1)
+        step_w = 2.0 / max(w_size, 1)
+        distances = []
+        z = voxel_coords[:, 0]
+        y = voxel_coords[:, 1]
+        x = voxel_coords[:, 2]
+        if d_size > 1:
+            distances.append(torch.where(z > 0, torch.full_like(z, step_d, dtype=torch.float32), torch.full_like(z, float("inf"), dtype=torch.float32)))
+            distances.append(torch.where(z < d_size - 1, torch.full_like(z, step_d, dtype=torch.float32), torch.full_like(z, float("inf"), dtype=torch.float32)))
+        if h_size > 1:
+            distances.append(torch.where(y > 0, torch.full_like(y, step_h, dtype=torch.float32), torch.full_like(y, float("inf"), dtype=torch.float32)))
+            distances.append(torch.where(y < h_size - 1, torch.full_like(y, step_h, dtype=torch.float32), torch.full_like(y, float("inf"), dtype=torch.float32)))
+        if w_size > 1:
+            distances.append(torch.where(x > 0, torch.full_like(x, step_w, dtype=torch.float32), torch.full_like(x, float("inf"), dtype=torch.float32)))
+            distances.append(torch.where(x < w_size - 1, torch.full_like(x, step_w, dtype=torch.float32), torch.full_like(x, float("inf"), dtype=torch.float32)))
+
+        if not distances:
+            base = torch.ones(voxel_coords.shape[0], 1, device=device) * 1e-3
+            return base.repeat(1, 3)
+
+        dist_tensor = torch.stack([dist.to(device) for dist in distances], dim=1)
+        nearest_three = torch.topk(dist_tensor, k=min(3, dist_tensor.shape[1]), largest=False, dim=1).values
+        if nearest_three.shape[1] < 3:
+            nearest_three = torch.cat([nearest_three, nearest_three[:, -1:].repeat(1, 3 - nearest_three.shape[1])], dim=1)
+        mean_dist = nearest_three.mean(dim=1, keepdim=True)
+        return mean_dist.repeat(1, 3)
+
+    @classmethod
+    def from_image(
+        cls,
+        image: torch.Tensor,
+        num_points: int,
+        initial_scale: float = 2.0,
+        density_scale_k: float = 0.2,
+        init_mode: str = "random",
+        device: str = "cuda:0",
+    ):
+        del initial_scale
+        dev = torch.device(device)
+        mag, densities_real, densities_imag = cls._extract_complex_image(image)
+        d_size, h_size, w_size = mag.shape
+        total_voxels = d_size * h_size * w_size
+        if num_points >= total_voxels:
+            indices = torch.arange(total_voxels, device=dev)
+            num_points = total_voxels
+        elif init_mode == "importance":
+            mag_flat = mag.flatten()
             threshold = torch.quantile(mag_flat, 0.90)
-            candidates = torch.nonzero(mag_flat > threshold).squeeze()
+            candidates = torch.nonzero(mag_flat > threshold, as_tuple=False).squeeze(-1)
             if candidates.numel() < num_points:
-                candidates = torch.arange(total_voxels, device=device)
-            idx_in_cand = torch.randperm(candidates.numel(), device=device)[:num_points]
-            indices = candidates[idx_in_cand]
+                candidates = torch.arange(total_voxels, device=dev)
+            choice = torch.randperm(candidates.numel(), device=dev)[:num_points]
+            indices = candidates[choice]
         else:
-            # Paper literal: "randomly sample M grid points"
-            if num_points >= total_voxels:
-                indices = torch.arange(total_voxels, device=device)
-                num_points = total_voxels
-            else:
-                indices = torch.randperm(total_voxels, device=device)[:num_points]
+            indices = torch.randperm(total_voxels, device=dev)[:num_points]
 
-        z = indices // (H * W)
-        rem = indices % (H * W)
-        y = rem // W
-        x = rem % W
-
-        positions = torch.stack([
-            z.float() / D * 2 - 1,
-            y.float() / H * 2 - 1,
-            x.float() / W * 2 - 1
-        ], dim=-1)
-
-        # Paper: "scales ... as the average of the distances to the three nearest grid points"
-        if num_points <= 5000 and num_points > 3:
-            dist_mat = torch.cdist(positions, positions)
-            dist_mat.fill_diagonal_(float('inf'))
-            vals, _ = dist_mat.topk(3, largest=False, dim=1)
-            mean_dist = vals.mean(dim=1, keepdim=True)
-            scales_init = mean_dist.repeat(1, 3)
-        elif num_points > 5000:
-            # paper-unspecified conservative implementation:
-            # Subsample-based 3-NN estimation for memory efficiency
-            sub_n = min(5000, num_points)
-            sub_idx = torch.randperm(num_points, device=device)[:sub_n]
-            sub_pos = positions[sub_idx]
-            dist_mat = torch.cdist(sub_pos, sub_pos)
-            dist_mat.fill_diagonal_(float('inf'))
-            vals, _ = dist_mat.topk(3, largest=False, dim=1)
-            avg_scale = vals.mean().item()
-            scales_init = torch.ones(num_points, 3, device=device) * avg_scale
-        else:
-            scales_init = torch.ones(num_points, 3, device=device) * (2.0 / D)
-
+        voxel_coords, positions = cls._grid_positions_from_indices(indices, (d_size, h_size, w_size))
+        scales_init = cls._exact_grid_scale_init(voxel_coords, (d_size, h_size, w_size), dev)
         init_den_r = densities_real.flatten()[indices] * density_scale_k
         init_den_i = densities_imag.flatten()[indices] * density_scale_k
         initial_densities = torch.complex(init_den_r, init_den_i)
 
-        print(f"[Init] mode={init_mode}, M={num_points}, k={density_scale_k}, "
-              f"scale_range=[{scales_init.min().item():.4f}, {scales_init.max().item():.4f}]")
+        print(
+            f"[Init] mode={init_mode}, M={num_points}, k={density_scale_k}, "
+            f"scale_range=[{scales_init.min().item():.6f}, {scales_init.max().item():.6f}]"
+        )
 
         return cls(
             num_points=num_points,
-            volume_shape=(D, H, W),
+            volume_shape=(d_size, h_size, w_size),
             initial_positions=positions,
             initial_densities=initial_densities,
             initial_scales=scales_init,
-            device=device
+            device=device,
         )

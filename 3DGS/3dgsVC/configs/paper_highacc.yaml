@@ -1,8 +1,4 @@
-# =============================================================================
-# 3DGSMR paper-faithful default profile
-# Default maps to the paper low-mid acceleration branch.
-# =============================================================================
-
+# Paper-faithful high-acceleration profile for 10x/12x experiments.
 mode:
   paper_faithful: true
   experimental_reproduction: true
@@ -14,7 +10,7 @@ mode:
 data:
   data_path: "/data/data54/wanghaobo/data/3D_Data/raw_data2/ksp.mat"
   csm_path: null
-  acceleration_factor: 8
+  acceleration_factor: 10
   mask_type: "stacked_2d_gaussian"
   readout_axis: 0
   phase_axes: [1, 2]
@@ -22,7 +18,7 @@ data:
   acs_lines: 32
 
 gaussian:
-  initial_num_points: 200000
+  initial_num_points: 500
   max_num_points: 400000
   density_scale_k: 0.2
   init_method: "from_image"
@@ -36,7 +32,7 @@ gaussian:
 
 adaptive_control:
   enable: true
-  strategy: "original"
+  strategy: "long_axis"
   densify_from_iter: 100
   densify_every: 100
   densify_until_iter: 2500
@@ -45,11 +41,11 @@ adaptive_control:
   opacity_threshold: 0.01
   max_scale: 0.5
   high_acceleration_threshold: 10
-  use_long_axis_splitting: false
-  use_cloning: true
+  use_long_axis_splitting: true
+  use_cloning: false
 
 training:
-  max_iterations: 600
+  max_iterations: 1200
   save_every: 200
   log_every: 25
   eval_every: 50
@@ -68,8 +64,8 @@ loss:
 stopping:
   enable_metric_plateau: true
   enable_loss_plateau: false
-  min_iterations_before_stop: 200
-  patience_evals: 4
+  min_iterations_before_stop: 400
+  patience_evals: 6
   best_metric: "psnr"
   metric_min_delta:
     psnr: 0.05
@@ -79,7 +75,7 @@ stopping:
 
 output:
   output_dir: "./results"
-  exp_name: "3dgsmr_paper_lowmid"
+  exp_name: "3dgsmr_paper_highacc"
   save_nii: true
   save_npy: true
   use_tensorboard: true

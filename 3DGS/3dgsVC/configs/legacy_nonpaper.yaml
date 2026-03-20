@@ -1,21 +1,17 @@
-# =============================================================================
-# 3DGSMR paper-faithful default profile
-# Default maps to the paper low-mid acceleration branch.
-# =============================================================================
-
+# Legacy/non-paper profile kept for debugging and backward compatibility.
 mode:
-  paper_faithful: true
+  paper_faithful: false
   experimental_reproduction: true
   self_supervised_deploy: false
-  strict_cuda: true
+  strict_cuda: false
   require_lpips: false
   auto_test_after_train: true
 
 data:
   data_path: "/data/data54/wanghaobo/data/3D_Data/raw_data2/ksp.mat"
   csm_path: null
-  acceleration_factor: 8
-  mask_type: "stacked_2d_gaussian"
+  acceleration_factor: 4
+  mask_type: "poisson"
   readout_axis: 0
   phase_axes: [1, 2]
   use_acs: true
@@ -26,7 +22,7 @@ gaussian:
   max_num_points: 400000
   density_scale_k: 0.2
   init_method: "from_image"
-  init_mode: "random"
+  init_mode: "importance"
   position_lr: 0.001
   scale_lr: 0.005
   rotation_lr: 0.001
@@ -36,23 +32,23 @@ gaussian:
 
 adaptive_control:
   enable: true
-  strategy: "original"
+  strategy: "auto"
   densify_from_iter: 100
   densify_every: 100
   densify_until_iter: 2500
-  grad_threshold: 0.01
+  grad_threshold: 0.005
   scale_threshold: 0.01
   opacity_threshold: 0.01
   max_scale: 0.5
   high_acceleration_threshold: 10
-  use_long_axis_splitting: false
-  use_cloning: true
+  use_long_axis_splitting: true
+  use_cloning: false
 
 training:
-  max_iterations: 600
-  save_every: 200
-  log_every: 25
-  eval_every: 50
+  max_iterations: 3000
+  save_every: 500
+  log_every: 50
+  eval_every: 100
   lr_scheduler:
     type: "exponential"
     gamma: 0.999
@@ -66,10 +62,10 @@ loss:
   loss_type: "l2"
 
 stopping:
-  enable_metric_plateau: true
+  enable_metric_plateau: false
   enable_loss_plateau: false
-  min_iterations_before_stop: 200
-  patience_evals: 4
+  min_iterations_before_stop: 0
+  patience_evals: 0
   best_metric: "psnr"
   metric_min_delta:
     psnr: 0.05
@@ -79,7 +75,7 @@ stopping:
 
 output:
   output_dir: "./results"
-  exp_name: "3dgsmr_paper_lowmid"
+  exp_name: "3dgsmr_legacy"
   save_nii: true
   save_npy: true
   use_tensorboard: true
@@ -96,7 +92,7 @@ hardware:
   num_workers: 16
 
 voxelizer:
-  type: "tile_cuda"
+  type: "chunk"
   tile_size: 8
   max_radius: 20
   reference_type: "tile"
