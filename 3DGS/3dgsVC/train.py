@@ -34,6 +34,12 @@ def parse_args():
     parser.add_argument('--initial_points', type=int, default=None, help='Override initial number of Gaussian points')
     parser.add_argument('--gpu', type=int, default=0, help='GPU device ID')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--voxelizer', type=str, default=None,
+                        choices=['chunk', 'tile', 'tile_cuda'],
+                        help='Voxelizer backend: chunk (legacy), tile (PyTorch), tile_cuda (CUDA)')
+    parser.add_argument('--strategy', type=str, default=None,
+                        choices=['auto', 'original', 'long_axis'],
+                        help='Adaptive control strategy override')
     
     # [新增] 训练时的自动测试切片参数
     parser.add_argument('--slices_axial', nargs='+', type=int, help='Test slices for Axial view')
@@ -82,7 +88,13 @@ def override_config(config: dict, args) -> dict:
     
     if args.seed is not None:
         config['training']['seed'] = args.seed
-        
+
+    if args.voxelizer is not None:
+        config.setdefault('voxelizer', {})['type'] = args.voxelizer
+
+    if args.strategy is not None:
+        config.setdefault('adaptive_control', {})['strategy'] = args.strategy
+
     return config
 
 

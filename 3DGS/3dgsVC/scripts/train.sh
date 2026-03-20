@@ -20,6 +20,10 @@ SLICES_AXIAL=""
 SLICES_CORONAL=""
 SLICES_SAGITTAL=""
 
+# Voxelizer / strategy
+VOXELIZER=""
+STRATEGY=""
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         --config) CONFIG="$2"; shift 2 ;;
@@ -31,7 +35,9 @@ while [[ $# -gt 0 ]]; do
         --seed) SEED="$2"; shift 2 ;;
         --resume) RESUME="$2"; shift 2 ;;
         --data_path) DATA_PATH="$2"; shift 2 ;;
-        
+        --voxelizer) VOXELIZER="$2"; shift 2 ;;
+        --strategy) STRATEGY="$2"; shift 2 ;;
+
         # [新增]
         --slices_axial) SLICES_AXIAL="$2"; shift 2 ;;
         --slices_coronal) SLICES_CORONAL="$2"; shift 2 ;;
@@ -46,6 +52,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 export CUDA_VISIBLE_DEVICES=${GPU}
+# Required for CUDA JIT compilation of tile_cuda voxelizer
+export CUDA_HOME="${CONDA_PREFIX:-/home/wanghaobo/.conda/envs/pt110}"
 cd ${PROJECT_ROOT}
 
 CMD="python train.py --config ${CONFIG} --gpu 0"
@@ -57,6 +65,8 @@ if [ -n "${MAX_ITERATIONS}" ]; then CMD="${CMD} --max_iterations ${MAX_ITERATION
 if [ -n "${INITIAL_POINTS}" ]; then CMD="${CMD} --initial_points ${INITIAL_POINTS}"; fi
 if [ -n "${SEED}" ]; then CMD="${CMD} --seed ${SEED}"; fi
 if [ -n "${RESUME}" ]; then CMD="${CMD} --resume ${RESUME}"; fi
+if [ -n "${VOXELIZER}" ]; then CMD="${CMD} --voxelizer ${VOXELIZER}"; fi
+if [ -n "${STRATEGY}" ]; then CMD="${CMD} --strategy ${STRATEGY}"; fi
 
 # [新增] 传递切片参数
 if [ -n "${SLICES_AXIAL}" ]; then CMD="${CMD} --slices_axial ${SLICES_AXIAL}"; fi

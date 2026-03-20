@@ -1,12 +1,22 @@
 # =============================================================================
 # 3DGSMR: 3D Gaussian Representation for MRI Reconstruction
-# Default Configuration File (Fully Aligned with Paper)
+# Default Configuration File — Aligned with Paper (TMI 2025)
+#
+# Paper hyperparameters (Table I, ablation at 8x, M=200k):
+#   M=200k, k=0.2, s=0.01, lambda=0.1
+# High acceleration (>=10x, Table II):
+#   long-axis splitting, no cloning, M=500
+#
+# Strategy "auto" resolves based on M and acceleration:
+#   M≤1000 (any acc)   → long-axis, no clone
+#   M>1000  + acc<10x  → original clone+split
+#   M>1000  + acc>=10x → long-axis, no clone, M→500
 # =============================================================================
 
 # Data Configuration
 data:
-  data_path:  "/data/data54/wanghaobo/data/3D_Data/raw_data2/ksp.mat"  # Supports .h5 and .mat k-space files
-  csm_path: null # "/data0/congcong/data/3D_data/h5data/csm.mat" null
+  data_path:  "/data/data54/wanghaobo/data/3D_Data/raw_data2/ksp.mat"
+  csm_path: null
   acceleration_factor: 4
   mask_type: "poisson"
   use_acs: true
@@ -14,9 +24,13 @@ data:
 
 # Gaussian Model Configuration
 gaussian:
-  initial_num_points: 500
-  max_num_points: 400000
+  initial_num_points: 200000   # Paper Table I: M=200k; override with --initial_points
+  max_num_points: 400000       # Paper Section G
   initial_scale: 2.0
+  density_scale_k: 0.2        # Paper Table I: k=0.2
+  # init_mode: "importance" (default) samples from high-magnitude regions;
+  #            "random" for strict paper literal ("randomly sample M grid points")
+  init_mode: "importance"
   position_lr: 0.001
   scale_lr: 0.005
   rotation_lr: 0.001
@@ -26,12 +40,15 @@ gaussian:
 # Adaptive Control (Densification) Configuration
 adaptive_control:
   enable: true
-  densify_from_iter: 100
-  densify_every: 100
+  densify_from_iter: 100       # Paper Section G
+  densify_every: 100           # Paper Section G
   densify_until_iter: 2500
-  grad_threshold: 0.005
+  grad_threshold: 0.005        # τ, gradient threshold for densification
+  scale_threshold: 0.01        # Paper Table I: s=0.01
+  strategy: "auto"             # "auto" | "original" | "long_axis"
+  high_acceleration_threshold: 10
+  # Legacy explicit controls (used when strategy is not auto/original/long_axis)
   use_long_axis_splitting: true
-  scale_threshold: 0.0005
   use_cloning: false
   opacity_threshold: 0.01
 
@@ -43,17 +60,16 @@ training:
   eval_every: 100
   lr_scheduler:
     type: "exponential"
-    gamma: 0.95
-    step_size: 200
+    gamma: 0.999               # paper-unspecified; 0.999 → moderate decay
   seed: 42
-  max_grad_norm: 1.0
+  max_grad_norm: 1.0           # paper-unspecified engineering safeguard
 
 # Loss Configuration
 loss:
   kspace_weight: 1.0
   image_weight: 0.0
-  tv_weight: 0.1
-  loss_type: "l2"
+  tv_weight: 0.1               # Paper Table I: lambda=0.1
+  loss_type: "l2"              # Paper Eq.(2)
 
 # Output Configuration
 output:
@@ -63,16 +79,24 @@ output:
   save_npy: true
   use_tensorboard: true
 
-# Test Configuration (New Added)
+# Test Configuration
 test:
-  # 默认切片索引 (如果没有在命令行指定)
   slices:
-    axial: [57, 85, 114]     # D dim
-    coronal: [45, 68, 90]    # H dim
-    sagittal: [52, 78, 104]  # W dim
+    axial: [57, 85, 114]
+    coronal: [45, 68, 90]
+    sagittal: [52, 78, 104]
 
 # Hardware Configuration
 hardware:
   device: "cuda:0"
   use_amp: false
   num_workers: 16
+
+# Voxelizer Configuration (Paper Section E)
+# "chunk"     = chunk-based sparse accumulation (default, fast, no compilation)
+# "tile"      = tile-based in PyTorch (paper algorithm, portable)
+# "tile_cuda" = tile-based CUDA kernels (experimental, requires compilation)
+voxelizer:
+  type: "chunk"
+  tile_size: 8
+  max_radius: 20               # cap in voxels; prevents huge Gaussian bboxes from killing performance

@@ -29,7 +29,7 @@ except ImportError:
     HAS_NIBABEL = False
 
 from data import MRIDataset
-from gaussian import GaussianModel3D, Voxelizer
+from gaussian import GaussianModel3D, Voxelizer, TileVoxelizer
 from metrics import evaluate_reconstruction
 
 def parse_args():
@@ -118,10 +118,20 @@ class GaussianTester:
         )
         self.gaussian_model.load_state_dict(checkpoint['gaussian_state'])
         
-        self.voxelizer = Voxelizer(
-            volume_shape=tuple(self.volume_shape),
-            device=str(self.device)
-        )
+        self.voxelizer = self._create_voxelizer(tuple(self.volume_shape))
+
+    def _create_voxelizer(self, volume_shape):
+        """Create voxelizer from config, matching trainer logic."""
+        vox_config = self.config.get('voxelizer', {})
+        vox_type = vox_config.get('type', 'chunk')
+        tile_size = vox_config.get('tile_size', 8)
+        max_radius = vox_config.get('max_radius', 20)
+        if vox_type == 'tile_cuda':
+            return TileVoxelizer(volume_shape, tile_size, max_radius, use_cuda=True, device=str(self.device))
+        elif vox_type == 'tile':
+            return TileVoxelizer(volume_shape, tile_size, max_radius, use_cuda=False, device=str(self.device))
+        else:
+            return Voxelizer(volume_shape, device=str(self.device))
         
     def reconstruct(self) -> torch.Tensor:
         self.gaussian_model.eval()

@@ -126,44 +126,58 @@ class GaussianModel3D(nn.Module):
                 mask_other[torch.arange(K), longest_axis] = False
                 new_scale[mask_other] *= 0.85
                 
-                # 长轴本身也需要变短以避免重叠太大，这里保持0.6
-                new_scale[torch.arange(K), longest_axis] *= 0.6
+                # Paper: "splits the Gaussian points along the longest axis to half"
+                new_scale[torch.arange(K), longest_axis] *= 0.5
                 
                 new_positions = torch.cat([new_pos_1, new_pos_2], dim=0)
                 new_scales = torch.cat([new_scale, new_scale], dim=0)
                 new_rotations = torch.cat([p_rot, p_rot], dim=0)
                 
-                # 修正: 论文 Page 3 "central values are scaled down by a factor of 0.6"
+                # Paper Section D: "central values are scaled down by a factor of 0.6"
+                # (long-axis splitting specific)
                 new_den_r = torch.cat([p_den_r * 0.6, p_den_r * 0.6], dim=0)
                 new_den_i = torch.cat([p_den_i * 0.6, p_den_i * 0.6], dim=0)
-                
+
             else:
-                # 原始策略
+                # Original splitting strategy (Paper Section D):
+                # "each with size equals to the original Gaussian size scaled by a factor of 1/1.6"
+                # "central values are scaled down by half"
                 std = p_scale
                 offset = torch.randn_like(p_pos) * std * 0.5
                 new_positions = torch.cat([p_pos - offset, p_pos + offset], dim=0)
                 new_scales = torch.cat([p_scale/1.6, p_scale/1.6], dim=0)
                 new_rotations = torch.cat([p_rot, p_rot], dim=0)
-                new_den_r = torch.cat([p_den_r * 0.6, p_den_r * 0.6], dim=0)
-                new_den_i = torch.cat([p_den_i * 0.6, p_den_i * 0.6], dim=0)
+                new_den_r = torch.cat([p_den_r * 0.5, p_den_r * 0.5], dim=0)
+                new_den_i = torch.cat([p_den_i * 0.5, p_den_i * 0.5], dim=0)
 
             keep_mask = ~mask
             self._update_params(keep_mask, new_positions, new_scales, new_rotations, new_den_r, new_den_i)
             return K
 
     def densify_and_clone(self, grads, grad_threshold, scale_threshold):
+        """
+        Paper Section D: "For cloning, another Gaussian point of the same shape and scale
+        is added in the same position. The central density values are scaled to half."
+        Both original and clone get density/2.
+        """
         with torch.no_grad():
              scales = self.get_scale_values()
              max_scales = scales.max(dim=-1)[0]
              mask = (grads > grad_threshold) & (max_scales <= scale_threshold)
              if mask.sum() == 0: return 0
-             
+
+             # Paper: "central density values are scaled to half"
+             # Halve density of originals that will be cloned
+             self.density_real.data[mask] *= 0.5
+             self.density_imag.data[mask] *= 0.5
+
              new_pos = self.positions[mask]
              new_scale = scales[mask]
              new_rot = self.rotations[mask]
-             new_dr = self.density_real[mask]
-             new_di = self.density_imag[mask]
-             
+             # Clone inherits the already-halved density
+             new_dr = self.density_real[mask].clone()
+             new_di = self.density_imag[mask].clone()
+
              self.positions = nn.Parameter(torch.cat([self.positions, new_pos], dim=0))
              self.scales = nn.Parameter(torch.cat([self.scales, torch.log(new_scale+1e-8)], dim=0))
              self.rotations = nn.Parameter(torch.cat([self.rotations, new_rot], dim=0))
@@ -196,23 +210,27 @@ class GaussianModel3D(nn.Module):
         self.num_points = self.positions.shape[0]
 
     @classmethod
-    def from_image(cls, image: torch.Tensor, num_points: int, initial_scale: float = 2.0, device: str = "cuda:0"):
+    def from_image(cls, image: torch.Tensor, num_points: int, initial_scale: float = 2.0,
+                   density_scale_k: float = 0.2, init_mode: str = "importance",
+                   device: str = "cuda:0"):
+        """
+        Paper Section C: Initialize from zero-filled iFFT reconstruction.
+
+        init_mode:
+          "importance" — sample from high-magnitude voxels (practical, avoids
+                         wasting Gaussians on background/air). Recommended for M≤10k.
+          "random"     — uniform random from all voxels (paper literal: "randomly
+                         sample M grid points"). Works well for large M (200k).
+        """
         # Handle [2, D, H, W] input
         if image.ndim == 4 and image.shape[0] == 2:
             C, D, H, W = image.shape
-            # Compute magnitude for initialization probability
             mag = torch.sqrt(image[0]**2 + image[1]**2)
-            # Flatten for sampling
-            mag_flat = mag.flatten()
-            
-            # Densities from real/imag parts
             densities_real = image[0]
             densities_imag = image[1]
         else:
             D, H, W = image.shape
             mag = torch.abs(image)
-            mag_flat = mag.flatten()
-            
             if torch.is_complex(image):
                 densities_real = image.real
                 densities_imag = image.imag
@@ -220,41 +238,65 @@ class GaussianModel3D(nn.Module):
                 densities_real = image
                 densities_imag = torch.zeros_like(image)
 
-        threshold = torch.quantile(mag_flat, 0.90)
-        candidates = torch.nonzero(mag_flat > threshold).squeeze()
-        
-        if candidates.numel() < num_points:
-            candidates = torch.arange(mag_flat.numel(), device=device)
-        
-        indices_idx = torch.randperm(candidates.numel(), device=device)[:num_points]
-        indices = candidates[indices_idx]
-        
+        total_voxels = D * H * W
+        mag_flat = mag.flatten()
+
+        if init_mode == "importance":
+            # Sample from high-magnitude regions (top 90%)
+            # Avoids wasting Gaussians on zero-signal background
+            threshold = torch.quantile(mag_flat, 0.90)
+            candidates = torch.nonzero(mag_flat > threshold).squeeze()
+            if candidates.numel() < num_points:
+                candidates = torch.arange(total_voxels, device=device)
+            idx_in_cand = torch.randperm(candidates.numel(), device=device)[:num_points]
+            indices = candidates[idx_in_cand]
+        else:
+            # Paper literal: "randomly sample M grid points"
+            if num_points >= total_voxels:
+                indices = torch.arange(total_voxels, device=device)
+                num_points = total_voxels
+            else:
+                indices = torch.randperm(total_voxels, device=device)[:num_points]
+
         z = indices // (H * W)
         rem = indices % (H * W)
         y = rem // W
         x = rem % W
-        
+
         positions = torch.stack([
             z.float() / D * 2 - 1,
             y.float() / H * 2 - 1,
             x.float() / W * 2 - 1
         ], dim=-1)
-        
-        if num_points > 3:
+
+        # Paper: "scales ... as the average of the distances to the three nearest grid points"
+        if num_points <= 5000 and num_points > 3:
             dist_mat = torch.cdist(positions, positions)
             dist_mat.fill_diagonal_(float('inf'))
             vals, _ = dist_mat.topk(3, largest=False, dim=1)
             mean_dist = vals.mean(dim=1, keepdim=True)
             scales_init = mean_dist.repeat(1, 3)
+        elif num_points > 5000:
+            # paper-unspecified conservative implementation:
+            # Subsample-based 3-NN estimation for memory efficiency
+            sub_n = min(5000, num_points)
+            sub_idx = torch.randperm(num_points, device=device)[:sub_n]
+            sub_pos = positions[sub_idx]
+            dist_mat = torch.cdist(sub_pos, sub_pos)
+            dist_mat.fill_diagonal_(float('inf'))
+            vals, _ = dist_mat.topk(3, largest=False, dim=1)
+            avg_scale = vals.mean().item()
+            scales_init = torch.ones(num_points, 3, device=device) * avg_scale
         else:
-            scales_init = torch.ones(num_points, 3, device=device) * (2.0/D)
-        
-        # 密度初始化缩放因子 (Paper Table 1: k=0.15)
-        init_den_r = densities_real.flatten()[indices] * 0.15
-        init_den_i = densities_imag.flatten()[indices] * 0.15
-        
+            scales_init = torch.ones(num_points, 3, device=device) * (2.0 / D)
+
+        init_den_r = densities_real.flatten()[indices] * density_scale_k
+        init_den_i = densities_imag.flatten()[indices] * density_scale_k
         initial_densities = torch.complex(init_den_r, init_den_i)
-        
+
+        print(f"[Init] mode={init_mode}, M={num_points}, k={density_scale_k}, "
+              f"scale_range=[{scales_init.min().item():.4f}, {scales_init.max().item():.4f}]")
+
         return cls(
             num_points=num_points,
             volume_shape=(D, H, W),
