@@ -25,6 +25,7 @@ class MRIDataset(Dataset):
         use_acs: bool = True,
         acs_lines: int = 24,
         csm_path: Optional[str] = None,
+        mask_path: Optional[str] = None,
         readout_axis: Optional[int] = None,
         phase_axes: Optional[Tuple[int, int]] = None,
         normalize_kspace: bool = True,
@@ -38,6 +39,7 @@ class MRIDataset(Dataset):
         self.use_acs = use_acs
         self.acs_lines = acs_lines
         self.csm_path = csm_path
+        self.mask_path = mask_path
         self.readout_axis = readout_axis
         self.phase_axes = tuple(phase_axes) if phase_axes is not None else None
         self.normalize_kspace = normalize_kspace
@@ -253,20 +255,56 @@ class MRIDataset(Dataset):
 
     def _generate_mask(self):
         shape = self.volume_shape
-        if self.mask_type in {"stacked_2d_gaussian", "gaussian"}:
-            mask = self._generate_stacked_2d_gaussian_mask(shape)
-        elif self.mask_type == "poisson":
-            mask = self._generate_poisson_mask(shape)
-        elif self.mask_type == "random":
-            mask = self._generate_random_mask(shape)
-        else:
-            raise ValueError(f"Unsupported mask_type: {self.mask_type}")
-        if self.use_acs:
-            mask = self._add_acs_region(mask)
-        self._validate_mask_geometry(mask)
+        mask = None
+        external = False
+        if self.mask_path and self.mask_path != "None":
+            try:
+                mask = self._load_external_mask(self.mask_path)
+                external = True
+            except Exception as exc:
+                print(f"Failed to load external mask: {exc}")
+                print("Falling back to generated mask.")
+        if mask is None:
+            if self.mask_type in {"stacked_2d_gaussian", "gaussian"}:
+                mask = self._generate_stacked_2d_gaussian_mask(shape)
+            elif self.mask_type == "poisson":
+                mask = self._generate_poisson_mask(shape)
+            elif self.mask_type == "random":
+                mask = self._generate_random_mask(shape)
+            else:
+                raise ValueError(f"Unsupported mask_type: {self.mask_type}")
+            if self.use_acs:
+                mask = self._add_acs_region(mask)
+        self._validate_mask_geometry(mask, skip_acs_check=external)
         self.mask = mask
         actual_acc = mask.numel() / max(mask.sum().item(), 1.0)
-        print(f"Generated {self.mask_type} mask with actual acceleration: {actual_acc:.2f}x")
+        source = "external" if external else self.mask_type
+        print(f"Using {source} mask with actual acceleration: {actual_acc:.2f}x")
+
+    def _load_external_mask(self, path: str) -> torch.Tensor:
+        print(f"Loading external mask from {path}")
+        mat = scipy.io.loadmat(path)
+        possible_keys = ["mask", "sampling_mask", "pattern"]
+        mask_key = next((key for key in possible_keys if key in mat), None)
+        if mask_key is None:
+            keys = [key for key in mat.keys() if not key.startswith("__")]
+            if keys:
+                mask_key = max(keys, key=lambda key: mat[key].size)
+        if mask_key is None:
+            raise ValueError("Could not find mask variable in file")
+        mask = torch.from_numpy(mat[mask_key]).float()
+        # If mask has coil dimension, take first coil (mask is same for all coils)
+        if mask.ndim == 4 and mask.shape[-1] == self.num_coils:
+            mask = mask[..., 0]
+        elif mask.ndim == 4 and mask.shape[0] == self.num_coils:
+            mask = mask[0]
+        if mask.shape != torch.Size(self.volume_shape):
+            raise ValueError(
+                f"External mask shape {tuple(mask.shape)} does not match volume shape {self.volume_shape}"
+            )
+        # Binarize
+        mask = (mask > 0.5).float()
+        return mask
 
     def _phase_shape(self, shape: Tuple[int, int, int]) -> Tuple[int, int]:
         return tuple(shape[axis] for axis in self.phase_axes)
@@ -346,22 +384,23 @@ class MRIDataset(Dataset):
         mask[tuple(index)] = 1.0
         return mask
 
-    def _validate_mask_geometry(self, mask: torch.Tensor):
+    def _validate_mask_geometry(self, mask: torch.Tensor, skip_acs_check: bool = False):
         readout_size = self.volume_shape[self.readout_axis]
         collapsed = mask.sum(dim=self.readout_axis)
         if not torch.all((collapsed == 0) | (collapsed == readout_size)):
             raise ValueError("Mask violates readout fully-sampled geometry.")
-        acs_index = [slice(None)] * mask.ndim
-        acs_index[self.readout_axis] = slice(None)
-        for axis in self.phase_axes:
-            size = self.volume_shape[axis]
-            center = size // 2
-            half_acs = self.acs_lines // 2
-            start = max(0, center - half_acs)
-            end = min(size, center + half_acs)
-            acs_index[axis] = slice(start, end)
-        if self.use_acs and not torch.all(mask[tuple(acs_index)] == 1):
-            raise ValueError("ACS region is not fully sampled.")
+        if not skip_acs_check:
+            acs_index = [slice(None)] * mask.ndim
+            acs_index[self.readout_axis] = slice(None)
+            for axis in self.phase_axes:
+                size = self.volume_shape[axis]
+                center = size // 2
+                half_acs = self.acs_lines // 2
+                start = max(0, center - half_acs)
+                end = min(size, center + half_acs)
+                acs_index[axis] = slice(start, end)
+            if self.use_acs and not torch.all(mask[tuple(acs_index)] == 1):
+                raise ValueError("ACS region is not fully sampled.")
         if self.acceleration_factor > 1 and torch.all(collapsed == readout_size):
             raise ValueError("Mask does not undersample the phase-encoding plane.")
 

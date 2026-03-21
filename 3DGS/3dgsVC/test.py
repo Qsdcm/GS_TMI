@@ -91,6 +91,7 @@ class GaussianTester:
             use_acs=data_config.get("use_acs", True),
             acs_lines=data_config.get("acs_lines", 24),
             csm_path=data_config.get("csm_path"),
+            mask_path=data_config.get("mask_path"),
             readout_axis=data_config.get("readout_axis"),
             phase_axes=tuple(data_config["phase_axes"]) if data_config.get("phase_axes") is not None else None,
             normalize_kspace=data_config.get("normalize", data_config.get("normalize_kspace", True)),

@@ -22,13 +22,15 @@
 3DGS/3dgsVC/trainers/__pycache__/__init__.cpython-310.pyc
 3DGS/3dgsVC/trainers/__pycache__/trainer.cpython-39.pyc
 3DGS/3dgsVC/trainers/__pycache__/trainer.cpython-310.pyc
+3DGS/3dgsVC/__pycache__/train.cpython-310.pyc
+3DGS/3dgsVC/losses/__pycache__/kspace_loss.cpython-310.pyc
 
 .claude/settings.json
 .claude/settings.local.json
 
 3DGS/3DGS.pdf
 
-3DGS/3dgsVC/results/
+
 3DGS/3dgsVC/gaussian/__pycache__/tile_voxelizer.cpython-310.pyc
 3DGS/train.sh
 .gitignore
@@ -36,3 +38,10 @@
 3DGS/final_longaxis_dc/paper_lowmid_acc8_pts200000_long_axis_tile_cuda_seed42
 3DGS/run_exp1/paper_lowmid_acc8_pts500_long_axis_tile_cuda_seed42
 3DGS/run_exp1/paper_lowmid_acc8_pts200000_long_axis_tile_cuda_seed42
+
+3DGS/3dgsVC/gaussian/cuda_ext/build/
+3DGS/test_cuda/__pycache__/benchmark_tile_cuda.cpython-310.pyc
+.gitignore
+3DGS/3dgsVC/results/paper_lowmid_acc8_pts500_long_axis_tile_cuda_seed42/
+3DGS/test_csm/visualize_csm.py
+3DGS/test_cuda/benchmark_tile_cuda.py
