@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover
     HAS_NIBABEL = False
 
 from data import MRIDataset
+from data.transforms import fft3c, ifft3c
 from gaussian import GaussianModel3D, TileVoxelizer, Voxelizer
 from metrics import evaluate_reconstruction
 
@@ -50,6 +51,10 @@ def set_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
 
 class GaussianTester:
@@ -86,15 +91,26 @@ class GaussianTester:
             use_acs=data_config.get("use_acs", True),
             acs_lines=data_config.get("acs_lines", 24),
             csm_path=data_config.get("csm_path"),
-            readout_axis=data_config.get("readout_axis", 0),
-            phase_axes=tuple(data_config.get("phase_axes", [1, 2])),
+            readout_axis=data_config.get("readout_axis"),
+            phase_axes=tuple(data_config["phase_axes"]) if data_config.get("phase_axes") is not None else None,
+            normalize_kspace=data_config.get("normalize", data_config.get("normalize_kspace", True)),
+            normalization_percentile=data_config.get("normalization_percentile", 99.9),
             device=str(self.device),
         )
         data = self.dataset.get_data()
         self.volume_shape = tuple(data["volume_shape"])
         self.target_image = data["ground_truth"].to(self.device)
-        self.zero_filled = data["zero_filled"].to(self.device)
+        self.zero_filled = data.get("zero_filled_complex", data["zero_filled"]).to(self.device)
+        self.kspace_undersampled_complex = data.get("kspace_undersampled_complex")
+        if self.kspace_undersampled_complex is None:
+            kspace_ri = data["kspace_undersampled"]
+            num_coils = kspace_ri.shape[0] // 2
+            self.kspace_undersampled_complex = torch.complex(kspace_ri[:num_coils], kspace_ri[num_coils:])
+        self.kspace_undersampled_complex = self.kspace_undersampled_complex.to(self.device)
         self.mask = data["mask"].to(self.device)
+        self.mask_coils = self.mask.unsqueeze(0)
+        self.sensitivity_maps = data["sensitivity_maps"].to(self.device)
+        self.normalization_scale = float(data.get("normalization_scale", 1.0))
 
     def _setup_model(self, checkpoint: Dict[str, Any]):
         gaussian_state = checkpoint["gaussian_state"]
@@ -124,6 +140,14 @@ class GaussianTester:
         else:
             self.voxelizer = Voxelizer(tuple(self.volume_shape), device=str(self.device))
 
+    def _apply_hard_data_consistency(self, volume: torch.Tensor) -> torch.Tensor:
+        if not self.config.get("mode", {}).get("apply_hard_data_consistency", True):
+            return volume
+        pred_kspace = fft3c(volume.unsqueeze(0) * self.sensitivity_maps)
+        kspace_dc = pred_kspace * (1.0 - self.mask_coils) + self.kspace_undersampled_complex
+        coil_images_dc = ifft3c(kspace_dc)
+        return torch.sum(torch.conj(self.sensitivity_maps) * coil_images_dc, dim=0)
+
     def reconstruct(self) -> torch.Tensor:
         self.gaussian_model.eval()
         with torch.no_grad():
@@ -136,6 +160,7 @@ class GaussianTester:
             )
             if isinstance(volume, tuple):
                 volume = torch.complex(volume[0], volume[1])
+            volume = self._apply_hard_data_consistency(volume)
             print(f"Reconstruction took {time.time() - start:.2f}s")
         return volume
 
@@ -155,7 +180,7 @@ class GaussianTester:
                 recon_volume,
                 self.target_image,
                 compute_3d_ssim=True,
-                compute_lpips_metric=mode.get("experimental_reproduction", True),
+                compute_lpips_metric=self.config.get("metrics", {}).get("compute_lpips_during_test", False),
                 lpips_device=self.device,
                 require_lpips=mode.get("require_lpips", False),
             )
@@ -163,7 +188,7 @@ class GaussianTester:
                 self.zero_filled,
                 self.target_image,
                 compute_3d_ssim=True,
-                compute_lpips_metric=mode.get("experimental_reproduction", True),
+                compute_lpips_metric=self.config.get("metrics", {}).get("compute_lpips_during_test", False),
                 lpips_device=self.device,
                 require_lpips=mode.get("require_lpips", False),
             )

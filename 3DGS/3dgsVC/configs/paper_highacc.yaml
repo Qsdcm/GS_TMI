@@ -9,20 +9,22 @@ mode:
 
 data:
   data_path: "/data/data54/wanghaobo/data/3D_Data/raw_data2/ksp.mat"
-  csm_path: null
+  csm_path: "/data/data54/wanghaobo/data/3D_Data/raw_data2/csm.mat"
   acceleration_factor: 10
   mask_type: "stacked_2d_gaussian"
-  readout_axis: 0
-  phase_axes: [1, 2]
+  readout_axis: 1
+  phase_axes: [0, 2]
   use_acs: true
   acs_lines: 32
+  normalize_kspace: true
+  normalization_percentile: 99.9
 
 gaussian:
   initial_num_points: 500
   max_num_points: 400000
   density_scale_k: 0.2
   init_method: "from_image"
-  init_mode: "random"
+  init_mode: "importance"
   position_lr: 0.001
   scale_lr: 0.005
   rotation_lr: 0.001
@@ -38,7 +40,7 @@ adaptive_control:
   densify_until_iter: 2500
   grad_threshold: 0.01
   scale_threshold: 0.01
-  opacity_threshold: 0.01
+  opacity_threshold: 0.001
   max_scale: 0.5
   high_acceleration_threshold: 10
   use_long_axis_splitting: true
@@ -53,7 +55,7 @@ training:
     type: "exponential"
     gamma: 0.999
   seed: 42
-  max_grad_norm: 1.0
+  max_grad_norm: 0.0
 
 loss:
   kspace_weight: 1.0
@@ -62,9 +64,9 @@ loss:
   loss_type: "l2"
 
 stopping:
-  enable_metric_plateau: true
+  enable_metric_plateau: false
   enable_loss_plateau: false
-  min_iterations_before_stop: 400
+  min_iterations_before_stop: 1500
   patience_evals: 6
   best_metric: "psnr"
   metric_min_delta:
@@ -78,7 +80,7 @@ output:
   exp_name: "3dgsmr_paper_highacc"
   save_nii: true
   save_npy: true
-  use_tensorboard: true
+  use_tensorboard: false
 
 test:
   slices:
@@ -96,3 +98,7 @@ voxelizer:
   tile_size: 8
   max_radius: 20
   reference_type: "tile"
+
+metrics:
+  compute_lpips_during_train: false
+  compute_lpips_during_test: false

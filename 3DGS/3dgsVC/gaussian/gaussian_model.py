@@ -1,6 +1,12 @@
+import numpy as np
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple
+
+try:
+    from scipy.spatial import cKDTree
+except Exception:  # pragma: no cover
+    cKDTree = None
 
 
 def quaternion_to_rotation_matrix(quaternion: torch.Tensor) -> torch.Tensor:
@@ -247,6 +253,32 @@ class GaussianModel3D(nn.Module):
         mean_dist = nearest_three.mean(dim=1, keepdim=True)
         return mean_dist.repeat(1, 3)
 
+    @staticmethod
+    def _sampled_3nn_scale_init(
+        voxel_coords: torch.Tensor,
+        positions: torch.Tensor,
+        shape: Tuple[int, int, int],
+        device: torch.device,
+    ) -> torch.Tensor:
+        if positions.shape[0] <= 1 or cKDTree is None:
+            return GaussianModel3D._exact_grid_scale_init(voxel_coords, shape, device)
+
+        pos_np = positions.detach().cpu().numpy().astype(np.float32)
+        tree = cKDTree(pos_np)
+        k = min(4, pos_np.shape[0])
+        distances, _ = tree.query(pos_np, k=k, workers=-1)
+        if k == 1:
+            mean_dist = np.full((pos_np.shape[0], 1), 1e-3, dtype=np.float32)
+        else:
+            neighbor_dist = np.asarray(distances[:, 1:], dtype=np.float32)
+            if neighbor_dist.ndim == 1:
+                neighbor_dist = neighbor_dist[:, None]
+            if neighbor_dist.shape[1] < 3:
+                pad = np.repeat(neighbor_dist[:, -1:], 3 - neighbor_dist.shape[1], axis=1)
+                neighbor_dist = np.concatenate([neighbor_dist, pad], axis=1)
+            mean_dist = np.maximum(neighbor_dist[:, :3].mean(axis=1, keepdims=True), 1e-6)
+        return torch.from_numpy(np.repeat(mean_dist, 3, axis=1)).to(device=device, dtype=torch.float32)
+
     @classmethod
     def from_image(
         cls,
@@ -277,7 +309,7 @@ class GaussianModel3D(nn.Module):
             indices = torch.randperm(total_voxels, device=dev)[:num_points]
 
         voxel_coords, positions = cls._grid_positions_from_indices(indices, (d_size, h_size, w_size))
-        scales_init = cls._exact_grid_scale_init(voxel_coords, (d_size, h_size, w_size), dev)
+        scales_init = cls._sampled_3nn_scale_init(voxel_coords, positions, (d_size, h_size, w_size), dev)
         init_den_r = densities_real.flatten()[indices] * density_scale_k
         init_den_i = densities_imag.flatten()[indices] * density_scale_k
         initial_densities = torch.complex(init_den_r, init_den_i)

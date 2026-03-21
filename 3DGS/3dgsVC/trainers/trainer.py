@@ -15,10 +15,8 @@ try:
 except Exception:  # pragma: no cover
     savemat = None
 
-from torch.utils.checkpoint import checkpoint as grad_checkpoint
-
 from data import MRIDataset
-from data.transforms import fft3c
+from data.transforms import fft3c, ifft3c
 from gaussian import GaussianModel3D, TileVoxelizer, Voxelizer
 from losses import CombinedLoss
 from losses.losses import TVLoss
@@ -35,6 +33,7 @@ class GaussianTrainer:
         self.self_supervised_deploy = self.mode.get("self_supervised_deploy", False)
         self.strict_cuda = self.mode.get("strict_cuda", False)
         self.require_lpips = self.mode.get("require_lpips", False)
+        self.metric_config = self.config.get("metrics", {})
         print(f"Using device: {self.device}")
         print(
             f"Modes: paper_faithful={self.paper_faithful}, experimental_reproduction={self.experimental_reproduction}, "
@@ -99,20 +98,32 @@ class GaussianTrainer:
             use_acs=data_config.get("use_acs", True),
             acs_lines=data_config.get("acs_lines", 24),
             csm_path=data_config.get("csm_path"),
-            readout_axis=data_config.get("readout_axis", 0),
-            phase_axes=tuple(data_config.get("phase_axes", [1, 2])),
+            readout_axis=data_config.get("readout_axis"),
+            phase_axes=tuple(data_config["phase_axes"]) if data_config.get("phase_axes") is not None else None,
+            normalize_kspace=data_config.get("normalize", data_config.get("normalize_kspace", True)),
+            normalization_percentile=data_config.get("normalization_percentile", 99.9),
             device=str(self.device),
         )
         data = self.dataset.get_data()
         self.kspace_full_cpu = data["kspace_full"]
-        self.kspace_undersampled = data["kspace_undersampled"].to(self.device)
+        self.kspace_undersampled_complex = data.get("kspace_undersampled_complex")
+        if self.kspace_undersampled_complex is None:
+            kspace_ri = data["kspace_undersampled"]
+            num_coils = kspace_ri.shape[0] // 2
+            self.kspace_undersampled_complex = torch.complex(kspace_ri[:num_coils], kspace_ri[num_coils:])
+        self.kspace_undersampled_complex = self.kspace_undersampled_complex.to(self.device)
         self.mask = data["mask"].to(self.device)
+        self.mask_coils = self.mask.unsqueeze(0)
         self.volume_shape = tuple(data["volume_shape"])
         self.target_image = data["ground_truth"].to(self.device)
-        self._zero_filled_for_init = data["zero_filled"].to(self.device)
+        self._zero_filled_for_init = data.get("zero_filled_complex", data["zero_filled"]).to(self.device)
         self.sensitivity_maps = data["sensitivity_maps"].to(self.device)
+        self.normalization_scale = float(data.get("normalization_scale", 1.0))
         self.num_coils = self.sensitivity_maps.shape[0]
-        print(f"Volume shape: {self.volume_shape}, coils: {self.num_coils}, acc: {data_config['acceleration_factor']}x")
+        print(
+            f"Volume shape: {self.volume_shape}, coils: {self.num_coils}, acc: {data_config['acceleration_factor']}x, "
+            f"norm_scale: {self.normalization_scale:.6f}"
+        )
         del self.dataset
 
     def _setup_model(self):
@@ -221,88 +232,38 @@ class GaussianTrainer:
             return torch.complex(vol_result[0], vol_result[1])
         return vol_result
 
+    def _apply_hard_data_consistency(self, volume: torch.Tensor) -> torch.Tensor:
+        if not self.mode.get("apply_hard_data_consistency", True):
+            return volume
+        pred_kspace = fft3c(volume.unsqueeze(0) * self.sensitivity_maps)
+        kspace_dc = pred_kspace * (1.0 - self.mask_coils) + self.kspace_undersampled_complex
+        coil_images_dc = ifft3c(kspace_dc)
+        return torch.sum(torch.conj(self.sensitivity_maps) * coil_images_dc, dim=0)
+
     def forward(self) -> Tuple[torch.Tensor, torch.Tensor]:
         volume = self._as_complex_volume(self._get_volume())
-        kspace_real_list = []
-        kspace_imag_list = []
-        for coil_idx in range(self.num_coils):
-            coil_kspace = fft3c((volume * self.sensitivity_maps[coil_idx]).unsqueeze(0)).squeeze(0)
-            kspace_real_list.append(coil_kspace.real)
-            kspace_imag_list.append(coil_kspace.imag)
-        kspace_pred = torch.cat([torch.stack(kspace_real_list, 0), torch.stack(kspace_imag_list, 0)], 0)
+        kspace_pred = fft3c(volume.unsqueeze(0) * self.sensitivity_maps)
         return volume, kspace_pred
 
-    def _coil_loss(self, volume, coil_csm, target_real, target_imag, mask, is_l1):
-        coil_kspace = fft3c((volume * coil_csm).unsqueeze(0)).squeeze(0)
-        pred_real = coil_kspace.real * mask
-        pred_imag = coil_kspace.imag * mask
-        target_real = target_real * mask
-        target_imag = target_imag * mask
-        if bool(is_l1.item()):
-            return torch.abs(pred_real - target_real).sum() + torch.abs(pred_imag - target_imag).sum()
-        return ((pred_real - target_real) ** 2).sum() + ((pred_imag - target_imag) ** 2).sum()
-
-    def _coil_loss_ri(self, vol_r, vol_i, csm_r, csm_i, target_real, target_imag, mask, is_l1):
-        img_r = vol_r * csm_r - vol_i * csm_i
-        img_i = vol_r * csm_i + vol_i * csm_r
-        coil_kspace = fft3c(torch.complex(img_r, img_i).unsqueeze(0)).squeeze(0)
-        pred_real = coil_kspace.real * mask
-        pred_imag = coil_kspace.imag * mask
-        target_real = target_real * mask
-        target_imag = target_imag * mask
-        if bool(is_l1.item()):
-            return torch.abs(pred_real - target_real).sum() + torch.abs(pred_imag - target_imag).sum()
-        return ((pred_real - target_real) ** 2).sum() + ((pred_imag - target_imag) ** 2).sum()
+    def _kspace_loss(self, pred_kspace: torch.Tensor, loss_type: str) -> torch.Tensor:
+        diff = pred_kspace * self.mask_coils - self.kspace_undersampled_complex
+        if loss_type == "l1":
+            return torch.abs(diff).sum()
+        return diff.real.square().sum() + diff.imag.square().sum()
 
     def forward_with_loss(self):
         vol_result = self._get_volume()
-        is_ri = isinstance(vol_result, tuple)
-        if is_ri:
-            vol_r, vol_i = vol_result
-            volume_for_eval = torch.complex(vol_r.detach(), vol_i.detach())
-            device = vol_r.device
-        else:
-            volume = vol_result
-            volume_for_eval = volume
-            device = volume.device
+        volume = self._as_complex_volume(vol_result)
+        volume_for_eval = volume.detach()
 
         tv_weight = self.config["loss"].get("tv_weight", 0.0)
         tv_loss = None
         if tv_weight > 0:
-            if is_ri:
-                tv_loss = TVLoss()(torch.sqrt(vol_r ** 2 + vol_i ** 2 + 1e-12))
-            else:
-                tv_loss = TVLoss()(volume)
+            tv_loss = TVLoss()(volume)
 
         loss_type = self.config["loss"].get("loss_type", "l2")
-        is_l1 = torch.tensor(loss_type == "l1", device=device)
-        kspace_loss = torch.tensor(0.0, device=device)
-        for coil_idx in range(self.num_coils):
-            if is_ri:
-                coil_loss = grad_checkpoint(
-                    self._coil_loss_ri,
-                    vol_r,
-                    vol_i,
-                    self.sensitivity_maps[coil_idx].real.contiguous(),
-                    self.sensitivity_maps[coil_idx].imag.contiguous(),
-                    self.kspace_undersampled[coil_idx],
-                    self.kspace_undersampled[coil_idx + self.num_coils],
-                    self.mask,
-                    is_l1,
-                    use_reentrant=True,
-                )
-            else:
-                coil_loss = grad_checkpoint(
-                    self._coil_loss,
-                    volume,
-                    self.sensitivity_maps[coil_idx],
-                    self.kspace_undersampled[coil_idx],
-                    self.kspace_undersampled[coil_idx + self.num_coils],
-                    self.mask,
-                    is_l1,
-                    use_reentrant=True,
-                )
-            kspace_loss = kspace_loss + coil_loss
+        pred_kspace = fft3c(volume.unsqueeze(0) * self.sensitivity_maps)
+        kspace_loss = self._kspace_loss(pred_kspace, loss_type)
 
         losses = {"kspace_loss": kspace_loss}
         total_loss = self.config["loss"].get("kspace_weight", 1.0) * kspace_loss
@@ -312,7 +273,7 @@ class GaussianTrainer:
 
         image_weight = self.config["loss"].get("image_weight", 0.0)
         if image_weight > 0 and self.target_image is not None:
-            image_loss = self.criterion.image_loss(volume_for_eval, self.target_image)
+            image_loss = self.criterion.image_loss(volume, self.target_image)
             losses["image_loss"] = image_loss
             total_loss = total_loss + image_weight * image_loss
 
@@ -427,12 +388,12 @@ class GaussianTrainer:
             return {}
         self.gaussian_model.eval()
         with torch.no_grad():
-            volume = self._as_complex_volume(self._get_volume())
+            volume = self._apply_hard_data_consistency(self._as_complex_volume(self._get_volume()))
             return evaluate_reconstruction(
                 pred=volume,
                 target=self.target_image,
                 compute_3d_ssim=True,
-                compute_lpips_metric=True,
+                compute_lpips_metric=self.metric_config.get("compute_lpips_during_train", False),
                 lpips_device=self.device,
                 require_lpips=self.require_lpips,
             )
@@ -501,7 +462,9 @@ class GaussianTrainer:
             raise ImportError("Saving .mat requires scipy")
         self.gaussian_model.eval()
         with torch.no_grad():
-            volume = self._as_complex_volume(self._get_volume())
+            volume_raw = self._as_complex_volume(self._get_volume())
+            volume = self._apply_hard_data_consistency(volume_raw)
+            savemat(os.path.join(self.result_dir, f"reconstruction_raw_{iteration:06d}.mat"), {"reconstruction_raw": volume_raw.detach().cpu().numpy()}, do_compression=True)
             volume_np = volume.detach().cpu().numpy()
             savemat(os.path.join(self.result_dir, f"reconstruction_{iteration:06d}.mat"), {"reconstruction": volume_np}, do_compression=True)
             savemat(os.path.join(self.result_dir, "reconstruction_final.mat"), {"reconstruction": volume_np}, do_compression=True)

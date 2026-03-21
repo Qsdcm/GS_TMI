@@ -63,7 +63,7 @@ class PaperFaithfulTestCase(unittest.TestCase):
 
         shape = torch.tensor(image.shape, dtype=torch.float32)
         voxel_coords = torch.round((model.positions.detach() + 1.0) * 0.5 * shape - 0.5).long()
-        expected_scales = GaussianModel3D._exact_grid_scale_init(voxel_coords, image.shape, torch.device('cpu'))
+        expected_scales = GaussianModel3D._sampled_3nn_scale_init(voxel_coords, model.positions.detach(), image.shape, torch.device('cpu'))
         self.assertTrue(torch.allclose(model.get_scale_values().detach(), expected_scales, atol=1e-6, rtol=1e-6))
 
         z, y, x = voxel_coords[:, 0], voxel_coords[:, 1], voxel_coords[:, 2]
@@ -90,6 +90,27 @@ class PaperFaithfulTestCase(unittest.TestCase):
         cz = mask.shape[2] // 2
         self.assertTrue(torch.all(mask[:, cy - 1:cy + 1, cz - 1:cz + 1] == 1.0))
         self.assertLess(mask.sum().item(), mask.numel())
+        self.assertEqual(int(mask.sum().item() / readout_size), 16)
+
+    def test_auto_readout_axis_and_normalization(self):
+        asym_shape = (6, 10, 8, 2)
+        data_path = self.tmp_dir / 'synthetic_kspace_asym.mat'
+        savemat(data_path, {'kspace': np.ones(asym_shape, dtype=np.complex64) * (5.0 + 2.0j)})
+        dataset = MRIDataset(
+            data_path=str(data_path),
+            acceleration_factor=2,
+            mask_type='random',
+            use_acs=False,
+            acs_lines=0,
+            readout_axis=None,
+            phase_axes=None,
+            normalize_kspace=True,
+            normalization_percentile=100.0,
+            device='cpu',
+        )
+        self.assertEqual(dataset.readout_axis, 1)
+        self.assertEqual(dataset.phase_axes, (0, 2))
+        self.assertAlmostEqual(float(torch.abs(dataset.ground_truth_image).max()), 1.0, places=5)
 
     def test_forward_model_consistency(self):
         volume = torch.complex(torch.randn(8, 8, 8), torch.randn(8, 8, 8))

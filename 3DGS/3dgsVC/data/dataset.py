@@ -25,8 +25,10 @@ class MRIDataset(Dataset):
         use_acs: bool = True,
         acs_lines: int = 24,
         csm_path: Optional[str] = None,
-        readout_axis: int = 0,
+        readout_axis: Optional[int] = None,
         phase_axes: Optional[Tuple[int, int]] = None,
+        normalize_kspace: bool = True,
+        normalization_percentile: float = 99.9,
         device: str = "cuda:0",
     ):
         super().__init__()
@@ -38,7 +40,10 @@ class MRIDataset(Dataset):
         self.csm_path = csm_path
         self.readout_axis = readout_axis
         self.phase_axes = tuple(phase_axes) if phase_axes is not None else None
+        self.normalize_kspace = normalize_kspace
+        self.normalization_percentile = normalization_percentile
         self.device = device
+        self.normalization_scale = 1.0
         self._load_data()
 
     def _load_data(self):
@@ -64,6 +69,9 @@ class MRIDataset(Dataset):
 
     def _normalize_axis_config(self):
         n_dims = len(self.volume_shape)
+        if self.readout_axis is None:
+            self.readout_axis = int(np.argmax(self.volume_shape))
+            print(f"Inferred readout axis from spatial shape: {self.readout_axis}")
         if not 0 <= self.readout_axis < n_dims:
             raise ValueError(f"readout_axis must be within [0, {n_dims - 1}], got {self.readout_axis}")
         if self.phase_axes is None:
@@ -155,9 +163,10 @@ class MRIDataset(Dataset):
         return min(candidates, key=lambda axis: shape[axis])
 
     def _process_data(self):
-        csm_gt = self._get_best_available_csm()
         images_multicoil = ifft3c(self.kspace_multicoil)
+        csm_gt = self._get_best_available_csm(images_multicoil=images_multicoil)
         self.ground_truth_image = torch.sum(torch.conj(csm_gt) * images_multicoil, dim=0)
+        self._normalize_intensity_scale()
         self.kspace_full = fft3c(self.ground_truth_image)
         print(f"Ground truth generated using High-Res CSM. Shape: {self.ground_truth_image.shape}")
 
@@ -172,16 +181,36 @@ class MRIDataset(Dataset):
 
         self._apply_undersampling()
 
-    def _get_best_available_csm(self):
+    def _get_best_available_csm(self, images_multicoil: Optional[torch.Tensor] = None):
         if self.csm_path and self.csm_path != "None":
             try:
                 return self._load_external_csm(self.csm_path)
             except Exception as exc:
                 print(f"Failed to load external CSM for GT: {exc}")
         print("Estimating high-resolution CSM from full k-space for GT generation...")
-        images_multicoil = ifft3c(self.kspace_multicoil)
+        if images_multicoil is None:
+            images_multicoil = ifft3c(self.kspace_multicoil)
         rss = torch.sqrt(torch.sum(torch.abs(images_multicoil) ** 2, dim=0)) + 1e-12
         return images_multicoil / rss.unsqueeze(0)
+
+    def _normalize_intensity_scale(self):
+        if not self.normalize_kspace:
+            self.normalization_scale = 1.0
+            return
+
+        ground_truth_mag = torch.abs(self.ground_truth_image).reshape(-1)
+        if self.normalization_percentile >= 100.0:
+            scale = ground_truth_mag.max()
+        else:
+            scale = torch.quantile(ground_truth_mag, self.normalization_percentile / 100.0)
+        scale_value = float(torch.clamp(scale, min=1e-8).item())
+        self.normalization_scale = scale_value
+        self.kspace_multicoil = self.kspace_multicoil / scale_value
+        self.ground_truth_image = self.ground_truth_image / scale_value
+        print(
+            f"Normalized MRI intensity scale by P{self.normalization_percentile:g} magnitude = "
+            f"{self.normalization_scale:.6f}"
+        )
 
     def _estimate_csm_from_acs(self):
         print(f"Estimating low-resolution CSM from ACS region (center {self.acs_lines} lines)...")
@@ -251,15 +280,39 @@ class MRIDataset(Dataset):
     def _generate_stacked_2d_gaussian_mask(self, shape: Tuple[int, int, int]) -> torch.Tensor:
         phase_shape = self._phase_shape(shape)
         total_phase_points = phase_shape[0] * phase_shape[1]
-        target_phase_points = max(int(total_phase_points / self.acceleration_factor), 1)
+        target_phase_points = max(int(round(total_phase_points / float(self.acceleration_factor))), 1)
         phase_centers = [size // 2 for size in phase_shape]
         coords = [torch.arange(size, dtype=torch.float32) - center for size, center in zip(phase_shape, phase_centers)]
         grid_a, grid_b = torch.meshgrid(coords[0], coords[1], indexing="ij")
         sigma = min(phase_shape) / 4.0
-        prob = torch.exp(-(grid_a ** 2 + grid_b ** 2) / (2 * sigma ** 2))
-        prob = prob / prob.sum() * target_phase_points
-        prob = torch.clamp(prob, 0, 1)
-        mask_2d = (torch.rand(phase_shape) < prob).float()
+        weights = torch.exp(-(grid_a ** 2 + grid_b ** 2) / (2 * sigma ** 2))
+
+        acs_mask = torch.zeros(phase_shape, dtype=torch.bool)
+        if self.use_acs:
+            center_a, center_b = phase_centers
+            half_acs = self.acs_lines // 2
+            a_start = max(0, center_a - half_acs)
+            a_end = min(phase_shape[0], center_a + half_acs)
+            b_start = max(0, center_b - half_acs)
+            b_end = min(phase_shape[1], center_b + half_acs)
+            acs_mask[a_start:a_end, b_start:b_end] = True
+
+        candidate_mask = ~acs_mask
+        num_acs_points = int(acs_mask.sum().item())
+        remaining_points = min(
+            max(target_phase_points - num_acs_points, 0),
+            int(candidate_mask.sum().item()),
+        )
+
+        mask_2d = torch.zeros(phase_shape, dtype=torch.float32)
+        if remaining_points > 0:
+            candidate_indices = torch.nonzero(candidate_mask, as_tuple=False)
+            candidate_weights = weights[candidate_mask]
+            if float(candidate_weights.sum().item()) <= 0:
+                candidate_weights = torch.ones_like(candidate_weights)
+            chosen = torch.multinomial(candidate_weights, remaining_points, replacement=False)
+            sampled = candidate_indices[chosen]
+            mask_2d[sampled[:, 0], sampled[:, 1]] = 1.0
         return self._expand_phase_mask(mask_2d, shape)
 
     def _generate_poisson_mask(self, shape: Tuple[int, int, int]) -> torch.Tensor:
@@ -272,7 +325,11 @@ class MRIDataset(Dataset):
 
     def _generate_random_mask(self, shape: Tuple[int, int, int]) -> torch.Tensor:
         phase_shape = self._phase_shape(shape)
-        mask_2d = (torch.rand(phase_shape) < (1.0 / self.acceleration_factor)).float()
+        total_phase_points = phase_shape[0] * phase_shape[1]
+        target_phase_points = max(int(round(total_phase_points / float(self.acceleration_factor))), 1)
+        mask_2d = torch.zeros(phase_shape, dtype=torch.float32)
+        chosen = torch.randperm(total_phase_points)[:target_phase_points]
+        mask_2d.view(-1)[chosen] = 1.0
         return self._expand_phase_mask(mask_2d, shape)
 
     def _add_acs_region(self, mask: torch.Tensor) -> torch.Tensor:
@@ -312,6 +369,8 @@ class MRIDataset(Dataset):
         kspace_undersampled_complex = self.kspace_multicoil * self.mask.unsqueeze(0)
         image_multicoil = ifft3c(kspace_undersampled_complex)
         zero_filled_complex = torch.sum(torch.conj(self.sensitivity_maps) * image_multicoil, dim=0)
+        self.kspace_undersampled_complex = kspace_undersampled_complex.contiguous()
+        self.zero_filled_complex = zero_filled_complex.contiguous()
         self.zero_filled_image = torch.stack([zero_filled_complex.real, zero_filled_complex.imag], dim=0)
         self.kspace_undersampled = torch.cat([kspace_undersampled_complex.real, kspace_undersampled_complex.imag], dim=0)
         print(f"Applied undersampling. Non-zero ratio: {self.mask.sum() / self.mask.numel():.4f}")
@@ -322,11 +381,14 @@ class MRIDataset(Dataset):
         return {
             "kspace_full": self.kspace_full,
             "kspace_undersampled": self.kspace_undersampled,
+            "kspace_undersampled_complex": self.kspace_undersampled_complex,
             "mask": self.mask,
             "ground_truth": self.ground_truth_image,
             "zero_filled": self.zero_filled_image,
+            "zero_filled_complex": self.zero_filled_complex,
             "sensitivity_maps": self.sensitivity_maps,
             "volume_shape": self.volume_shape,
+            "normalization_scale": self.normalization_scale,
         }
 
     def __len__(self):
