@@ -319,7 +319,6 @@ class GaussianTrainer:
         scales = self.gaussian_model.get_scale_values()
         max_scale = scales.max(dim=-1)[0]
         split_mask = high_grad_mask & (max_scale > scale_threshold)
-        model_changed = False
         if split_mask.sum() > 0 and self.gaussian_model.num_points + int(split_mask.sum().item()) <= max_num_points:
             stats["split"] = self.gaussian_model.densify_and_split(
                 grads=grad_norm,
@@ -329,28 +328,64 @@ class GaussianTrainer:
                 long_axis_offset_factor=long_axis_offset_factor,
             )
             high_grad_mask = None
-            model_changed = stats["split"] > 0
+            if stats["split"] > 0:
+                self._rebuild_optimizer()
 
         if self._resolved_use_cloning and high_grad_mask is not None:
             clone_mask = high_grad_mask & (max_scale <= scale_threshold)
             if clone_mask.sum() > 0 and self.gaussian_model.num_points + int(clone_mask.sum().item()) <= max_num_points:
                 stats["clone"] = self.gaussian_model.densify_and_clone(grad_norm, grad_threshold, scale_threshold)
-                model_changed = model_changed or stats["clone"] > 0
+                if stats["clone"] > 0:
+                    self._rebuild_optimizer()
 
-        if model_changed:
-            scales = self.gaussian_model.get_scale_values()
-            max_scale = scales.max(dim=-1)[0]
-
+        scales = self.gaussian_model.get_scale_values()
+        max_scale = scales.max(dim=-1)[0]
         densities = torch.abs(self.gaussian_model.density)
         prune_mask = (densities < opacity_threshold) | (max_scale > max_scale_limit)
         keep_mask = ~prune_mask
         if keep_mask.sum() >= 100 and prune_mask.sum() > 0:
             self.gaussian_model._update_params(keep_mask, is_prune=True)
             stats["prune"] = int(prune_mask.sum().item())
-
-        if any(value > 0 for value in stats.values()):
             self._rebuild_optimizer()
+
         return stats
+
+    @staticmethod
+    def _transplant_adam_state(
+        old_optimizer: optim.Adam,
+        old_params_map: dict,
+        keep_mask: torch.Tensor,
+        is_prune: bool,
+        new_optimizer: optim.Adam,
+    ):
+        """Copy Adam exp_avg / exp_avg_sq from old optimizer to new one,
+        selecting only the kept rows (via *keep_mask*) and zero-padding any
+        newly appended rows (from split / clone)."""
+        for new_group, old_group in zip(
+            new_optimizer.param_groups, old_optimizer.param_groups
+        ):
+            for new_p, old_p in zip(new_group["params"], old_group["params"]):
+                if old_p not in old_optimizer.state:
+                    continue
+                old_s = old_optimizer.state[old_p]
+                if "exp_avg" not in old_s:
+                    continue
+                new_s = {}
+                for key in ("exp_avg", "exp_avg_sq"):
+                    old_buf = old_s[key]  # shape (N_old, ...)
+                    kept = old_buf[keep_mask]  # shape (N_kept, ...)
+                    if is_prune or kept.shape[0] == new_p.shape[0]:
+                        new_s[key] = kept
+                    else:
+                        # split / clone appended rows; pad with zeros
+                        pad_shape = list(kept.shape)
+                        pad_shape[0] = new_p.shape[0] - kept.shape[0]
+                        new_s[key] = torch.cat(
+                            [kept, torch.zeros(pad_shape, device=kept.device, dtype=kept.dtype)],
+                            dim=0,
+                        )
+                new_s["step"] = old_s.get("step", torch.tensor(0.0))
+                new_optimizer.state[new_p] = new_s
 
     def _rebuild_optimizer(self):
         gaussian_config = self.config["gaussian"]
@@ -360,7 +395,25 @@ class GaussianTrainer:
             lr_scale=gaussian_config.get("scale_lr", 5e-4),
             lr_rotation=gaussian_config.get("rotation_lr", 1e-4),
         )
+        # Capture current LR so the new optimizer continues at the decayed LR.
+        current_lrs = [group["lr"] for group in self.optimizer.param_groups]
+        old_optimizer = self.optimizer
         self.optimizer = optim.Adam(params)
+        for group, lr in zip(self.optimizer.param_groups, current_lrs):
+            group["lr"] = lr
+            group["initial_lr"] = lr
+
+        # Transplant Adam momentum from surviving Gaussian rows.
+        old_params_map = getattr(self.gaussian_model, "_last_densify_old_params", None)
+        keep_mask = getattr(self.gaussian_model, "_last_densify_keep_mask", None)
+        is_prune = getattr(self.gaussian_model, "_last_densify_is_prune", False)
+        if old_params_map is not None and keep_mask is not None:
+            self._transplant_adam_state(
+                old_optimizer, old_params_map, keep_mask, is_prune, self.optimizer
+            )
+            self.gaussian_model._last_densify_old_params = None
+            self.gaussian_model._last_densify_keep_mask = None
+
         scheduler_config = self.config["training"].get("lr_scheduler", {})
         if scheduler_config.get("type", "exponential") == "exponential":
             self.scheduler = ExponentialLR(self.optimizer, gamma=scheduler_config.get("gamma", 0.999))

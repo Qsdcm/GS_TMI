@@ -9,9 +9,9 @@ mode:
   apply_hard_data_consistency: true
 
 data:
-  data_path: "/data/data54/wanghaobo/data/3D_Data/raw_data2/ksp.mat"
-  csm_path: "/data/data54/wanghaobo/data/3D_Data/raw_data2/csm.mat"
-  mask_path: "/data/data54/wanghaobo/data/3D_Data/3Dmask/mask_af9_220_256_171_12_acs24.mat"
+  data_path: "/data0/congcong/data/3D_data/raw_data2/ksp.mat"
+  csm_path: "/data0/congcong/data/3D_data/raw_data2/csm.mat"
+  mask_path: "/data0/congcong/data/3D_data/3Dmask/mask_af9_220_256_171_12_acs24.mat"
   acceleration_factor: 8
   mask_type: "stacked_2d_gaussian"
   readout_axis: 2

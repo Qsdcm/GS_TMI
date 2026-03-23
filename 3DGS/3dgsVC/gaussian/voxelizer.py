@@ -22,9 +22,9 @@ class Voxelizer(nn.Module):
         """Process a single chunk, returning a flat volume contribution."""
         device = c_center.device
 
-        # Dynamic kernel size
+        # Dynamic kernel size based on actual 3-sigma radius
         max_r = torch.ceil(c_radius.max()).int().item()
-        max_r = min(max_r, 20)  # Hardware cap
+        max_r = min(max_r, max(D, H, W))  # cap at volume extent
 
         if max_r == 0:
             return torch.zeros(D * H * W, dtype=torch.complex64, device=device)
@@ -121,7 +121,7 @@ class Voxelizer(nn.Module):
 
             # Dynamic chunk_size: if kernel is large, process fewer points at a time
             max_r_est = torch.ceil(c_radius.max()).int().item()
-            max_r_est = min(max_r_est, 10)
+            max_r_est = min(max_r_est, max(D, H, W))
             kernel_size = (2 * max_r_est + 1) ** 3
 
             if kernel_size > 1000:

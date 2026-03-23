@@ -148,6 +148,20 @@ class GaussianModel3D(nn.Module):
             self.density_real.data[mask] *= 0.5
             self.density_imag.data[mask] *= 0.5
 
+            # Store old param refs for optimizer state transplant.
+            # Clone keeps ALL old rows and appends new ones.
+            n_old = self.positions.shape[0]
+            keep_all = torch.ones(n_old, dtype=torch.bool, device=self.positions.device)
+            self._last_densify_old_params = {
+                id(self.positions): self.positions,
+                id(self.scales): self.scales,
+                id(self.rotations): self.rotations,
+                id(self.density_real): self.density_real,
+                id(self.density_imag): self.density_imag,
+            }
+            self._last_densify_keep_mask = keep_all
+            self._last_densify_is_prune = False
+
             new_pos = self.positions[mask]
             new_scale = scales[mask]
             new_rot = self.rotations[mask]
@@ -181,6 +195,18 @@ class GaussianModel3D(nn.Module):
         new_di: Optional[torch.Tensor] = None,
         is_prune: bool = False,
     ):
+        # Store old param references and the mask so the optimizer can
+        # transplant Adam state for the surviving rows.
+        self._last_densify_old_params = {
+            id(self.positions): self.positions,
+            id(self.scales): self.scales,
+            id(self.rotations): self.rotations,
+            id(self.density_real): self.density_real,
+            id(self.density_imag): self.density_imag,
+        }
+        self._last_densify_keep_mask = mask
+        self._last_densify_is_prune = is_prune
+
         if is_prune:
             self.positions = nn.Parameter(self.positions[mask])
             self.scales = nn.Parameter(self.scales[mask])

@@ -284,7 +284,6 @@ class TileVoxelizer(nn.Module):
         center_vox = (positions + 1.0) * 0.5 * shape_tensor - 0.5
         scale_vox = scales * half_shape
         radius_vox = scale_vox.max(dim=-1)[0] * 3.0
-        radius_vox = radius_vox.clamp(max=float(self.max_radius))
         rotation_matrix = _quaternion_to_rotation_matrix(rotations)
         s_inv = torch.reciprocal(scales + 1e-8)
         transform = rotation_matrix * s_inv.unsqueeze(1)
