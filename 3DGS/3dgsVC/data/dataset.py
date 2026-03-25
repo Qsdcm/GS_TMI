@@ -100,7 +100,11 @@ class MRIDataset(Dataset):
             return handle[key][:]
 
     def _load_mat_kspace(self) -> np.ndarray:
-        variables = scipy.io.whosmat(self.data_path)
+        try:
+            variables = scipy.io.whosmat(self.data_path)
+        except NotImplementedError:
+            print("MATLAB v7.3 file detected, falling back to h5py reader.")
+            return self._load_h5_kspace()
         if len(variables) == 0:
             raise ValueError(f"No variables found in MATLAB file: {self.data_path}")
         preferred_keys = ["kspace", "ksp", "raw_kspace", "rawdata", "data"]
@@ -120,6 +124,10 @@ class MRIDataset(Dataset):
     def _normalize_kspace_layout(self, kspace_data: np.ndarray) -> np.ndarray:
         arr = np.asarray(kspace_data)
         arr = np.squeeze(arr)
+        # Handle HDF5 structured dtype like [('real', '<f4'), ('imag', '<f4')]
+        if arr.dtype.names is not None and 'real' in arr.dtype.names and 'imag' in arr.dtype.names:
+            arr = arr['real'] + 1j * arr['imag']
+            print(f"Converted structured real/imag dtype to complex: {arr.shape}")
         if not np.iscomplexobj(arr):
             arr = self._maybe_convert_real_imag_to_complex(arr)
         if arr.ndim != 4:
@@ -283,7 +291,32 @@ class MRIDataset(Dataset):
 
     def _load_external_mask(self, path: str) -> torch.Tensor:
         print(f"Loading external mask from {path}")
-        mat = scipy.io.loadmat(path)
+        try:
+            mat = scipy.io.loadmat(path)
+        except NotImplementedError:
+            if h5py is None:
+                raise ImportError("Reading v7.3 .mat mask files requires h5py.")
+            print("MATLAB v7.3 mask file detected, using h5py reader.")
+            with h5py.File(path, "r") as handle:
+                possible_keys = ["mask", "sampling_mask", "pattern"]
+                mask_key = next((key for key in possible_keys if key in handle), None)
+                if mask_key is None:
+                    keys = list(handle.keys())
+                    if keys:
+                        mask_key = max(keys, key=lambda k: np.prod(handle[k].shape))
+                if mask_key is None:
+                    raise ValueError("Could not find mask variable in file")
+                print(f"Using H5 mask key: {mask_key}")
+                mask = torch.from_numpy(handle[mask_key][:]).float()
+                if mask.ndim == 4 and mask.shape[-1] == self.num_coils:
+                    mask = mask[..., 0]
+                elif mask.ndim == 4 and mask.shape[0] == self.num_coils:
+                    mask = mask[0]
+                if mask.shape != torch.Size(self.volume_shape):
+                    raise ValueError(
+                        f"External mask shape {tuple(mask.shape)} does not match volume shape {self.volume_shape}"
+                    )
+                return (mask > 0.5).float()
         possible_keys = ["mask", "sampling_mask", "pattern"]
         mask_key = next((key for key in possible_keys if key in mat), None)
         if mask_key is None:

@@ -9,13 +9,13 @@ mode:
   apply_hard_data_consistency: true
 
 data:
-  data_path: "/data0/congcong/data/3D_data/raw_data2/ksp.mat"
-  csm_path: "/data0/congcong/data/3D_data/raw_data2/csm.mat"
-  mask_path: "/data0/congcong/data/3D_data/3Dmask/mask_af9_220_256_171_12_acs24.mat"
+  data_path: "/data/data54/wanghaobo/data/3D_Data/CE_Data/t1_3D_gre_fsp_sag_iso_ACS_16887049370060/ksp2.mat"
+  csm_path: "/data/data54/wanghaobo/data/3D_Data/CE_Data/t1_3D_gre_fsp_sag_iso_ACS_16887049370060/csm2.mat"
+  mask_path: null
   acceleration_factor: 8
   mask_type: "stacked_2d_gaussian"
-  readout_axis: 2
-  phase_axes: [0, 1]
+  readout_axis: 0
+  phase_axes: [1, 2]
   use_acs: true
   acs_lines: 24
   normalize_kspace: true
@@ -62,7 +62,7 @@ training:
 loss:
   kspace_weight: 1.0
   image_weight: 0.0
-  tv_weight: 0.001
+  tv_weight: 0.0012
   loss_type: "l2"
 
 stopping:
