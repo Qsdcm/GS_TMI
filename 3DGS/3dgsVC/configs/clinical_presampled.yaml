@@ -1,0 +1,112 @@
+# =============================================================================
+# Clinical presampled (real undersampled) data profile.
+# Input k-space is already undersampled — no simulated mask is applied.
+# self_supervised_deploy=true skips GT-based metrics.
+# =============================================================================
+
+mode:
+  paper_faithful: true
+  experimental_reproduction: true
+  self_supervised_deploy: true
+  strict_cuda: true
+  require_lpips: false
+  auto_test_after_train: false
+  apply_hard_data_consistency: true
+
+data:
+  data_path: "/data/data54/wanghaobo/data/3D_Data/CE_Data/t1_3D_gre_fsp_sag_iso_ACS_16887049370010/ksp.mat"
+  csm_path: "/data/data54/wanghaobo/data/3D_Data/CE_Data/t1_3D_gre_fsp_sag_iso_ACS_16887049370010/csm.mat"
+  mask_path: null
+  presampled: true
+  acceleration_factor: 1
+  mask_type: "stacked_2d_gaussian"
+  readout_axis: 0
+  phase_axes: [1, 2]
+  use_acs: true
+  acs_lines: 24
+  normalize_kspace: true
+  normalization_percentile: 99.9
+
+gaussian:
+  initial_num_points: 500
+  max_num_points: 500000
+  density_scale_k: 0.2
+  init_method: "from_image"
+  init_mode: "importance"
+  position_lr: 0.001
+  scale_lr: 0.005
+  rotation_lr: 0.001
+  density_lr: 0.01
+  complex_density: true
+  long_axis_offset_factor: 1.0
+
+adaptive_control:
+  enable: true
+  strategy: "long_axis"
+  densify_from_iter: 100
+  densify_every: 100
+  densify_until_iter: 2500
+  grad_threshold: 0.003
+  scale_threshold: 0.003
+  opacity_threshold: 0.001
+  max_scale: 0.5
+  high_acceleration_threshold: 8
+  use_long_axis_splitting: true
+  use_cloning: false
+
+training:
+  max_iterations: 3000
+  save_every: 100
+  log_every: 50
+  eval_every: 50
+  lr_scheduler:
+    type: "exponential"
+    gamma: 0.999
+  seed: 42
+  max_grad_norm: 0.0
+
+loss:
+  kspace_weight: 1.0
+  image_weight: 0.0
+  tv_weight: 0.0012
+  loss_type: "l2"
+
+stopping:
+  enable_metric_plateau: false
+  enable_loss_plateau: false
+  min_iterations_before_stop: 2500
+  patience_evals: 4
+  best_metric: "psnr"
+  metric_min_delta:
+    psnr: 0.05
+    ssim: 0.0005
+    lpips: 0.001
+  loss_min_delta: 1.0
+
+output:
+  output_dir: "./results_clinical"
+  exp_name: "3dgsmr_clinical_presampled"
+  save_nii: true
+  save_npy: true
+  use_tensorboard: false
+
+test:
+  slices:
+    axial: [57, 85, 114]
+    coronal: [45, 68, 90]
+    sagittal: [52, 78, 104]
+
+hardware:
+  device: "cuda:0"
+  use_amp: false
+  num_workers: 16
+
+voxelizer:
+  type: "tile_cuda"
+  tile_size: 8
+  max_radius: 32
+  reference_type: "tile"
+
+metrics:
+  compute_lpips_during_train: false
+  compute_lpips_during_test: false

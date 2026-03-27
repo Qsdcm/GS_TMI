@@ -19,13 +19,14 @@ CUDA_VISIBLE_DEVICES=2 PYTHONPATH=3dgsVC python 3dgsVC/train.py \
   --slices_axial 60 120 180 \
   --slices_coronal 60 120 180 \
   --slices_sagittal 40 80 120
+
 cd /data/data54/wanghaobo/Reproduce/GS_TMI/3DGS
 conda activate pt110
-CUDA_VISIBLE_DEVICES=5 PYTHONPATH=3dgsVC python 3dgsVC/train.py \
-  --config 3dgsVC/configs/paper_lowmid.yaml \
+CUDA_VISIBLE_DEVICES=4 PYTHONPATH=3dgsVC python 3dgsVC/train.py \
+  --config 3dgsVC/configs/clinical_presampled.yaml \
   --max_iterations 3000 \
   --output_dir ./3dgsVC/results_CE \
-  --acceleration 10 \
+  --acceleration 6 \
   --slices_axial 60 120 180 \
   --slices_coronal 60 120 180 \
   --slices_sagittal 40 80 120

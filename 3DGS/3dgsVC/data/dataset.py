@@ -31,6 +31,7 @@ class MRIDataset(Dataset):
         normalize_kspace: bool = True,
         normalization_percentile: float = 99.9,
         device: str = "cuda:0",
+        presampled: bool = False,
     ):
         super().__init__()
         self.data_path = data_path
@@ -46,6 +47,7 @@ class MRIDataset(Dataset):
         self.normalization_percentile = normalization_percentile
         self.device = device
         self.normalization_scale = 1.0
+        self.presampled = presampled
         self._load_data()
 
     def _load_data(self):
@@ -173,6 +175,62 @@ class MRIDataset(Dataset):
         return min(candidates, key=lambda axis: shape[axis])
 
     def _process_data(self):
+        if self.presampled:
+            self._process_data_presampled()
+        else:
+            self._process_data_simulated()
+
+    def _process_data_presampled(self):
+        """Process real clinical undersampled k-space data.
+
+        The input kspace is already undersampled — no GT is available.
+        Mask is inferred from the zero/non-zero pattern of the kspace data.
+        """
+        print("[Presampled] Input k-space is already undersampled (real clinical data).")
+
+        # Load CSM
+        if self.csm_path and self.csm_path != "None":
+            self.sensitivity_maps = self._load_external_csm(self.csm_path)
+            print("[Presampled] Using external CSM for reconstruction.")
+        else:
+            self.sensitivity_maps = self._estimate_csm_from_acs()
+            print("[Presampled] Using ACS-estimated CSM for reconstruction.")
+
+        # Infer mask from kspace: a voxel is sampled if any coil has non-zero value
+        ksp_energy = torch.sum(torch.abs(self.kspace_multicoil), dim=0)
+        self.mask = (ksp_energy > 0).float()
+        actual_acc = self.mask.numel() / max(self.mask.sum().item(), 1.0)
+        print(f"[Presampled] Inferred mask from k-space. Actual acceleration: {actual_acc:.2f}x")
+
+        # Normalize intensity using zero-filled image magnitude
+        images_multicoil = ifft3c(self.kspace_multicoil)
+        zero_filled_complex = torch.sum(torch.conj(self.sensitivity_maps) * images_multicoil, dim=0)
+        if self.normalize_kspace:
+            mag = torch.abs(zero_filled_complex).reshape(-1)
+            if self.normalization_percentile >= 100.0:
+                scale = mag.max()
+            else:
+                scale = torch.quantile(mag, self.normalization_percentile / 100.0)
+            scale_value = float(torch.clamp(scale, min=1e-8).item())
+            self.normalization_scale = scale_value
+            self.kspace_multicoil = self.kspace_multicoil / scale_value
+            zero_filled_complex = zero_filled_complex / scale_value
+            print(f"[Presampled] Normalized by P{self.normalization_percentile:g} magnitude = {self.normalization_scale:.6f}")
+
+        # No ground truth available — use zero-filled as placeholder
+        self.ground_truth_image = zero_filled_complex
+        self.kspace_full = fft3c(zero_filled_complex)
+
+        # Build undersampled outputs (kspace is already undersampled)
+        self.kspace_undersampled_complex = self.kspace_multicoil.contiguous()
+        self.zero_filled_complex = zero_filled_complex.contiguous()
+        self.zero_filled_image = torch.stack([zero_filled_complex.real, zero_filled_complex.imag], dim=0)
+        self.kspace_undersampled = torch.cat([self.kspace_multicoil.real, self.kspace_multicoil.imag], dim=0)
+        print(f"[Presampled] Zero-filled shape: {self.zero_filled_image.shape}")
+        print(f"[Presampled] Undersampled k-space shape: {self.kspace_undersampled.shape}")
+
+    def _process_data_simulated(self):
+        """Original pipeline: full kspace -> generate GT -> apply mask -> undersample."""
         images_multicoil = ifft3c(self.kspace_multicoil)
         csm_gt = self._get_best_available_csm(images_multicoil=images_multicoil)
         self.ground_truth_image = torch.sum(torch.conj(csm_gt) * images_multicoil, dim=0)
@@ -245,20 +303,49 @@ class MRIDataset(Dataset):
 
     def _load_external_csm(self, path: str):
         print(f"Loading external CSM from {path}")
-        mat = scipy.io.loadmat(path)
         possible_keys = ["csm", "sensitivity_maps", "maps", "S"]
-        csm_key = next((key for key in possible_keys if key in mat), None)
-        if csm_key is None:
-            keys = [key for key in mat.keys() if not key.startswith("__")]
-            if keys:
-                csm_key = max(keys, key=lambda key: mat[key].size)
-        if csm_key is None:
-            raise ValueError("Could not find CSM variable in file")
-        csm = torch.from_numpy(mat[csm_key])
+        try:
+            mat = scipy.io.loadmat(path)
+            csm_key = next((key for key in possible_keys if key in mat), None)
+            if csm_key is None:
+                keys = [key for key in mat.keys() if not key.startswith("__")]
+                if keys:
+                    csm_key = max(keys, key=lambda key: mat[key].size)
+            if csm_key is None:
+                raise ValueError("Could not find CSM variable in file")
+            csm_data = mat[csm_key]
+        except NotImplementedError:
+            if h5py is None:
+                raise ImportError("Reading v7.3 .mat CSM files requires h5py.")
+            print("MATLAB v7.3 CSM file detected, using h5py reader.")
+            with h5py.File(path, "r") as handle:
+                csm_key = next((key for key in possible_keys if key in handle), None)
+                if csm_key is None:
+                    keys = list(handle.keys())
+                    if keys:
+                        csm_key = max(keys, key=lambda k: np.prod(handle[k].shape))
+                if csm_key is None:
+                    raise ValueError("Could not find CSM variable in file")
+                print(f"Using H5 CSM key: {csm_key}")
+                csm_data = handle[csm_key][:]
+        csm_data = np.asarray(csm_data)
+        # Handle structured dtype like [('real', '<f4'), ('imag', '<f4')]
+        if csm_data.dtype.names is not None and 'real' in csm_data.dtype.names and 'imag' in csm_data.dtype.names:
+            csm_data = csm_data['real'] + 1j * csm_data['imag']
+        elif csm_data.dtype == np.void or csm_data.dtype.names is not None:
+            # Try interpreting as interleaved real/imag float32
+            csm_data = csm_data.view(np.float32).reshape(csm_data.shape + (2,))
+            csm_data = csm_data[..., 0] + 1j * csm_data[..., 1]
+        csm = torch.from_numpy(csm_data)
         if not torch.is_complex(csm):
-            csm = csm.to(torch.complex64)
-        if csm.shape != self.kspace_multicoil.shape and csm.shape[-1] == self.num_coils:
+            if csm.ndim >= 1 and csm.shape[-1] == 2:
+                csm = torch.complex(csm[..., 0], csm[..., 1])
+            else:
+                csm = csm.to(torch.complex64)
+        csm = csm.squeeze()
+        if csm.shape != self.kspace_multicoil.shape and csm.ndim == 4 and csm.shape[-1] == self.num_coils:
             csm = csm.permute(3, 0, 1, 2)
+        print(f"Loaded CSM shape: {csm.shape}")
         return csm
 
     def _generate_mask(self):

@@ -104,6 +104,7 @@ class GaussianTrainer:
             normalize_kspace=data_config.get("normalize", data_config.get("normalize_kspace", True)),
             normalization_percentile=data_config.get("normalization_percentile", 99.9),
             device=str(self.device),
+            presampled=data_config.get("presampled", False),
         )
         data = self.dataset.get_data()
         self.kspace_full_cpu = data["kspace_full"]
